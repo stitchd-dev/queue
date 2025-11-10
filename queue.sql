@@ -30,6 +30,8 @@ $$
     end
 $$;
 drop table if exists source;
+drop routine if exists get_current_dataset;
+drop routine if exists release_reservation;
 drop routine if exists add_destination;
 drop routine if exists create_dataset;
 drop routine if exists update_status;
@@ -58,6 +60,7 @@ create table queue
     destination_id      int references destination (id) not null,
     created_at          timestamp                       not null default now(),
     updated_at          timestamp                       not null default now(),
+    reserved_slots      int                             not null default 0,
     current_dataset     int                             not null default 0
         constraint queue_current_dataset_check check (current_dataset >= 0),
     processing_dataset  int                             not null default 0
@@ -86,7 +89,7 @@ begin
 
     execute format(
             'create table %I (
-                id     serial primary key,
+                id     uuid primary key,
                 data   jsonb not null,
                 source int references source (id) not null
             )',
@@ -95,7 +98,7 @@ begin
             'create table %I (
                 id         serial primary key,
                 status     job_status not null default ''pending'',
-                data       int references %I (id) not null,
+                data       uuid not null,
                 try_at     timestamp not null default now(),
                 retry_count int not null default 0,
                 created_at timestamp not null default now(),
@@ -166,5 +169,47 @@ begin
                 from unnest($1) as f where %I.id = f.id',
                 table_name) using failed_jobs;
     end if;
+end;
+$$ language plpgsql;
+
+create or replace function get_current_dataset(queue_id int, threshold int, expected_insertion_size int) returns int as
+$$
+declare
+    current_dataset int;
+    reserved_slots  int;
+    job_table_name  text;
+    count           int;
+begin
+    select queue.current_dataset, queue.reserved_slots
+    into current_dataset, reserved_slots
+    from queue
+    where id = queue_id for update;
+
+    job_table_name := format('queue_%s_job_%s', queue_id, current_dataset);
+    execute format('select count(*) from %I', job_table_name) into count;
+
+    if count >= threshold - expected_insertion_size - reserved_slots then
+        current_dataset := current_dataset + 1;
+        update queue
+        set current_dataset = current_dataset,
+            reserved_slots  = expected_insertion_size
+        where id = queue_id;
+        perform create_dataset(queue_id, current_dataset);
+    else
+        update queue
+        set reserved_slots = reserved_slots + expected_insertion_size
+        where id = queue_id;
+    end if;
+    return current_dataset;
+end;
+$$ language plpgsql;
+
+create or replace function release_reservation(queue_id int, dataset_id int, actual_inserted int) returns void as
+$$
+begin
+    update queue
+    set reserved_slots = greatest(0, reserved_slots - actual_inserted)
+    where id = queue_id
+      and current_dataset = dataset_id;
 end;
 $$ language plpgsql;

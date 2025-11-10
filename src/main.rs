@@ -1,3 +1,5 @@
+pub mod queue;
+
 use deadpool::Runtime;
 use deadpool_postgres::tokio_postgres::NoTls;
 use deadpool_postgres::{Config, ManagerConfig, RecyclingMethod};
