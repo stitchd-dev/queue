@@ -62,7 +62,7 @@ async fn main() {
     cfg.manager = Some(ManagerConfig { recycling_method: RecyclingMethod::Fast });
     let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls).unwrap();
 
-    let q: Arc<Queue> = Queue::get_queue(42, pool.clone())
+    let q: Arc<Queue> = Queue::get_queue(42, pool.clone(), None, None)
         .await
         .expect("destination must exist");
 

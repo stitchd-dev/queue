@@ -3,7 +3,7 @@
 //! This module implements an in-memory buffering queue that batches JSON payloads
 //! and periodically flushes them into PostgreSQL using efficient binary `COPY`.
 //! The queue supports two triggers for a flush ("sync"):
-//! - size-based: when the number of buffered items exceeds `threshold`
+//! - size-based: when the number of buffered items exceeds `max_size`
 //! - time-based: when `max_duration` elapses since the first item was added
 //!
 //! Concurrency model:
@@ -13,7 +13,7 @@
 //!
 //! Database expectations:
 //! - A row exists in table `queue` with this queue's `destination_id`.
-//! - Helper SQL functions exist: `get_current_dataset(queue_id, threshold, incoming_count)`
+//! - Helper SQL functions exist: `get_current_dataset(queue_id, max_size, incoming_count)`
 //!   that returns an integer dataset id, and `release_reservation(queue_id, dataset_id, count)`
 //!   to finalize reservations after COPY.
 //! - Physical partitioned tables are expected to exist and be named as:
@@ -42,14 +42,14 @@
 //! cfg.manager = Some(ManagerConfig { recycling_method: RecyclingMethod::Fast });
 //! let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls)?;
 //! 
-//! // Obtain a queue by destination id
-//! let queue: Arc<Queue> = Queue::get_queue(42, pool.clone()).await.map_err(|_| anyhow::anyhow!("missing destination"))?;
+//! // Obtain a queue by destination id (with default max_duration and max_size)
+//! let queue: Arc<Queue> = Queue::get_queue(42, pool.clone(), None, None).await.map_err(|_| anyhow::anyhow!("missing destination"))?;
 //! 
 //! // Insert some payloads from source id 7
 //! queue.insert_data(json!({"event": "signup", "user_id": 1}), 7).await?;
 //! queue.insert_data(json!({"event": "click", "path": "/home"}), 7).await?;
 //! 
-//! // Optionally force a flush (normally automatic by threshold/time)
+//! // Optionally force a flush (normally automatic by max_size/time)
 //! queue.sync_data().await;
 //! # Ok(())
 //! # }
@@ -79,7 +79,7 @@ pub struct Queue {
     /// Connection pool used for database operations.
     pool: deadpool_postgres::Pool,
     /// Number of buffered items that triggers an immediate sync when exceeded.
-    threshold: i16,
+    max_size: i16,
 }
 
 impl Queue {
@@ -88,11 +88,19 @@ impl Queue {
     /// Looks up the queue row and initializes the in-memory buffer. Returns an
     /// `Arc<Queue>` so the same queue can be shared across tasks.
     ///
+    /// Parameters:
+    /// - `destination_id`: The queue destination identifier.
+    /// - `pool`: Database connection pool.
+    /// - `max_duration`: Maximum time to wait before auto-flushing (default: 10 seconds).
+    /// - `max_size`: Maximum number of items before triggering a sync (default: 128).
+    ///
     /// Errors:
     /// - Returns `Err(())` if the destination id does not exist.
     pub async fn get_queue(
         destination_id: i64,
         pool: deadpool_postgres::Pool,
+        max_duration: Option<Duration>,
+        max_size: Option<i16>,
     ) -> Result<Arc<Queue>, ()> {
         let client = pool.get().await.unwrap();
         let stmt = client
@@ -106,11 +114,11 @@ impl Queue {
             Some(row) => Ok(Arc::new(Queue {
                 id: row.get(0),
                 data: Default::default(),
-                max_duration: Duration::from_secs(10),
+                max_duration: max_duration.unwrap_or(Duration::from_secs(10)),
                 sync_handle: Default::default(),
                 first_added_at: Mutex::new(None),
                 pool: pool.clone(),
-                threshold: 128,
+                max_size: max_size.unwrap_or(128),
             })),
         }
     }
@@ -119,7 +127,7 @@ impl Queue {
     ///
     /// Behavior:
     /// - If this is the first item in an empty buffer, starts a timed auto-sync.
-    /// - If the buffer size exceeds `threshold`, triggers an immediate sync.
+    /// - If the buffer size exceeds `max_size`, triggers an immediate sync.
     pub async fn insert_data(self: &Arc<Self>, data: Value, source_id: i64) -> Result<(), ()> {
         let uuid = Uuid::new_v4();
 
@@ -130,8 +138,8 @@ impl Queue {
             // Start timer for time-based flush.
             let _ = self.first_added_at.lock().await.insert(chrono::Utc::now());
             self.schedule_auto_sync().await;
-        } else if lock.len() > self.threshold as usize {
-            // Size-based flush when exceeding threshold.
+        } else if lock.len() > self.max_size as usize {
+            // Size-based flush when exceeding max_size.
             self.sync_data().await;
         }
 
@@ -213,7 +221,7 @@ impl Queue {
                 "SELECT get_current_dataset($1, $2, $3)",
                 &[
                     &(self.id as i32),
-                    &(self.threshold as i32),
+                    &(self.max_size as i32),
                     &(data.len() as i32),
                 ],
             )
