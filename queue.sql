@@ -1,5 +1,18 @@
+-- Event Queue schema and helper routines
+--
+-- This script defines a simple queuing model with partitioned/rotating datasets
+-- for high-throughput ingestion. The Rust `Queue` implementation uses two DB
+-- helper functions declared here: `get_current_dataset(queue_id, threshold, incoming_count)`
+-- to select/prepare the active dataset tables to write into, and
+-- `release_reservation(queue_id, dataset_id, count)` to finalize a reservation
+-- after COPY-ing rows. Data is written into tables named
+-- `queue_<queue_id>_data_<dataset_id>` and jobs into `queue_<queue_id>_job_<dataset_id>`.
+--
+-- The script also includes convenience routines for creating datasets and
+-- updating statuses for jobs, along with indexes to support scheduling.
+--
 -- Cleanup
-drop table if exists queue;
+ drop table if exists queue;
 drop table if exists destination;
 do
 $$
