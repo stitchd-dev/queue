@@ -9,7 +9,9 @@ use tokio::sync::RwLock;
 
 pub struct State {
     pool: deadpool_postgres::Pool,
-    queues: Arc<RwLock<HashMap<i64, Arc<Queue>>>>,
+    queues: Arc<RwLock<HashMap<i32, Arc<Queue>>>>,
+    max_size: i16,
+    max_duration: Duration,
 }
 
 impl State {
@@ -44,14 +46,16 @@ impl State {
         Ok(Self {
             pool,
             queues: Arc::new(RwLock::new(queues)),
+            max_size,
+            max_duration,
         })
     }
 
     pub async fn add_data(
         &self,
-        destination_id: i64,
+        destination_id: i32,
         data: Vec<Value>,
-        source_id: i64,
+        source_id: i32,
     ) -> Result<(), InsertionError> {
         let queue = self.queues.read().await.get(&destination_id).cloned();
 
@@ -78,22 +82,42 @@ impl State {
         }
     }
 
+    pub async fn add_source(
+        &self,
+        name: String,
+        source_type: String,
+    ) -> Result<i32, InsertionError> {
+        let client = self.pool.get().await?;
+        let stmt = client
+            .prepare_cached("insert into source (name, type) values ($1, $2) returning id")
+            .await?;
+
+        let mut row = client.query(&stmt, &[&name, &source_type]).await?;
+
+        if let Some(row) = row.pop() {
+            Ok(row.get(0))
+        } else {
+            Err(InsertionError::EmptyData)
+        }
+    }
+
     pub async fn add_destination(
         &self,
         name: String,
         destination_type: String,
         config: Value,
-    ) -> Result<(), InsertionError> {
+    ) -> Result<i32, InsertionError> {
         let client = self.pool.get().await?;
 
         let stmt = client
             .prepare_cached("select add_destination($1, $2, $3)")
             .await?;
 
-        let destination_id = client
+        let row = client
             .query_one(&stmt, &[&name, &destination_type, &config])
-            .await?
-            .get(0);
+            .await?;
+
+        let destination_id: i32 = row.get("add_destination");
 
         let stmt = client
             .prepare_cached("select id from queue where destination_id = $1")
@@ -101,10 +125,15 @@ impl State {
 
         let queue_id = client.query_one(&stmt, &[&destination_id]).await?.get(0);
 
-        let queue = Arc::new(Queue::get_queue(queue_id, self.pool.clone(), None, None));
+        let queue = Arc::new(Queue::get_queue(
+            queue_id,
+            self.pool.clone(),
+            Some(self.max_duration),
+            Some(self.max_size),
+        ));
 
         self.queues.write().await.insert(destination_id, queue);
 
-        Ok(())
+        Ok(destination_id)
     }
 }

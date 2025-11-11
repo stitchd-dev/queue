@@ -68,9 +68,9 @@ use uuid::Uuid;
 /// Constructed via `Queue::get_queue`, which loads metadata from the `queue` table.
 pub struct Queue {
     /// Database identifier of this queue (primary key of `queue` table).
-    id: i64,
+    id: i32,
     /// In-memory buffer mapping UUID -> (JSON payload, source id).
-    data: Mutex<HashMap<Uuid, (Value, i64)>>,
+    data: Mutex<HashMap<Uuid, (Value, i32)>>,
     /// Maximum time to wait since the first item was added before auto-flushing.
     max_duration: Duration,
     /// Handle to a scheduled background task that will run a timed sync.
@@ -98,7 +98,7 @@ impl Queue {
     /// Errors:
     /// - Returns `Err(())` if the destination id does not exist.
     pub fn get_queue(
-        id: i64,
+        id: i32,
         pool: deadpool_postgres::Pool,
         max_duration: Option<Duration>,
         max_size: Option<i16>,
@@ -122,7 +122,7 @@ impl Queue {
     pub async fn insert_data(
         self: &Arc<Self>,
         data: Vec<Value>,
-        source_id: i64,
+        source_id: i32,
     ) -> Result<(), InsertionError> {
         if data.len() > self.max_size as usize {
             return Err(InsertionError::BufferOverflow(self.max_size));
@@ -131,16 +131,20 @@ impl Queue {
             return Err(InsertionError::EmptyData);
         }
 
-        let mut lock = self.data.lock().await;
+        let length = {
+            let mut lock = self.data.lock().await;
 
-        if lock.is_empty() {
-            let _ = self.first_added_at.lock().await.insert(chrono::Utc::now());
-            self.schedule_auto_sync(Some(self.max_duration)).await;
-        }
+            if lock.is_empty() {
+                let _ = self.first_added_at.lock().await.insert(chrono::Utc::now());
+                self.schedule_auto_sync(Some(self.max_duration)).await;
+            }
 
-        lock.extend(data.into_iter().map(|d| (Uuid::new_v4(), (d, source_id))));
+            lock.extend(data.into_iter().map(|d| (Uuid::new_v4(), (d, source_id))));
 
-        if lock.len() >= self.max_size as usize {
+            lock.len()
+        };
+
+        if length >= self.max_size as usize {
             // Size-based flush when exceeding max_size.
             self.sync_data().await.map_err(|err| match err {
                 SyncError::Pool(e) => InsertionError::PoolError(e),
@@ -204,13 +208,9 @@ impl Queue {
     ///    into `queue_<id>_job_<dataset>`.
     /// 5. Call `release_reservation` with the actual inserted count, then commit.
     pub async fn sync_data(&self) -> Result<(), SyncError> {
-        // Cancel any existing scheduled sync
-        self.cancel_auto_sync().await;
-
         let data = {
             // Drain the buffer atomically to avoid losing entries on failure later.
-            let mut lock = self.data.lock().await;
-            let data = lock.drain().collect::<HashMap<_, _>>();
+            let data = self.data.lock().await.drain().collect::<HashMap<_, _>>();
 
             // Reset timing since the buffer is now empty.
             let _ = self.first_added_at.lock().await.take();
@@ -229,12 +229,8 @@ impl Queue {
         // Get the current dataset
         let dataset_id: i32 = tx
             .query_one(
-                "SELECT get_current_dataset($1, $2, $3)",
-                &[
-                    &(self.id as i32),
-                    &(self.max_size as i32),
-                    &(data.len() as i32),
-                ],
+                "SELECT get_current_dataset($1, $2)",
+                &[&(self.id), &(data.len() as i32)],
             )
             .await?
             .get(0);
@@ -255,7 +251,7 @@ impl Queue {
             &[
                 tokio_postgres::types::Type::UUID,
                 tokio_postgres::types::Type::JSONB,
-                tokio_postgres::types::Type::INT8,
+                tokio_postgres::types::Type::INT4,
             ],
         );
 

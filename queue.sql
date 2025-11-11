@@ -185,35 +185,43 @@ begin
 end;
 $$ language plpgsql;
 
-create or replace function get_current_dataset(queue_id int, threshold int, expected_insertion_size int) returns int as
+create or replace function get_current_dataset(queue_id int, expected_insertion_size int) returns int as
 $$
 declare
-    current_dataset int;
-    reserved_slots  int;
-    job_table_name  text;
-    count           int;
+    threshold      int;
+    dataset        int;
+    current_reserved_slots int;
+    job_table_name text;
+    count          int;
 begin
+    -- max partition size as 100k
+    threshold := 100000;
+
+    if expected_insertion_size > threshold then
+        raise exception 'expected_insertion_size must be less than %', threshold;
+    end if;
+
     select queue.current_dataset, queue.reserved_slots
-    into current_dataset, reserved_slots
+    into dataset, current_reserved_slots
     from queue
     where id = queue_id for update;
 
-    job_table_name := format('queue_%s_job_%s', queue_id, current_dataset);
+    job_table_name := format('queue_%s_job_%s', queue_id, dataset);
     execute format('select count(*) from %I', job_table_name) into count;
 
-    if count >= threshold - expected_insertion_size - reserved_slots then
-        current_dataset := current_dataset + 1;
+    if count >= threshold - expected_insertion_size - current_reserved_slots then
+        dataset := dataset + 1;
         update queue
-        set current_dataset = current_dataset,
+        set current_dataset = dataset,
             reserved_slots  = expected_insertion_size
         where id = queue_id;
-        perform create_dataset(queue_id, current_dataset);
+        perform create_dataset(queue_id, dataset);
     else
         update queue
-        set reserved_slots = reserved_slots + expected_insertion_size
+        set reserved_slots = current_reserved_slots + expected_insertion_size
         where id = queue_id;
     end if;
-    return current_dataset;
+    return dataset;
 end;
 $$ language plpgsql;
 
