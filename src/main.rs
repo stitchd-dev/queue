@@ -6,6 +6,8 @@
 //! it to buffer and flush events.
 
 pub mod queue;
+pub mod state;
+mod error;
 
 use deadpool::Runtime;
 use deadpool_postgres::tokio_postgres::NoTls;
@@ -27,15 +29,4 @@ async fn main() {
     });
 
     let pool = config.create_pool(Some(Runtime::Tokio1), NoTls).unwrap();
-
-    // Quick smoke test against the database.
-    println!("{:?}", pool);
-
-    for i in 1..10i32 {
-        let client = pool.get().await.unwrap();
-        let stmt = client.prepare_cached("SELECT 1 + $1").await.unwrap();
-        let rows = client.query(&stmt, &[&i]).await.unwrap();
-        let value: i32 = rows[0].get(0);
-        assert_eq!(value, i + 1);
-    }
 }

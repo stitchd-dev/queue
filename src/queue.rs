@@ -1,5 +1,5 @@
 //! Queue module
-//! 
+//!
 //! This module implements an in-memory buffering queue that batches JSON payloads
 //! and periodically flushes them into PostgreSQL using efficient binary `COPY`.
 //! The queue supports two triggers for a flush ("sync"):
@@ -30,7 +30,7 @@
 //! use deadpool_postgres::{Config, ManagerConfig, RecyclingMethod};
 //! use deadpool_postgres::tokio_postgres::NoTls;
 //! use serde_json::json;
-//! 
+//!
 //! # async fn example() -> anyhow::Result<()> {
 //! // Build a pool (normally from env/config)
 //! let mut cfg = Config::new();
@@ -41,20 +41,23 @@
 //! cfg.port = Some(5432);
 //! cfg.manager = Some(ManagerConfig { recycling_method: RecyclingMethod::Fast });
 //! let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls)?;
-//! 
+//!
 //! // Obtain a queue by destination id (with default max_duration and max_size)
 //! let queue: Arc<Queue> = Queue::get_queue(42, pool.clone(), None, None).await.map_err(|_| anyhow::anyhow!("missing destination"))?;
-//! 
+//!
 //! // Insert some payloads from source id 7
 //! queue.insert_data(json!({"event": "signup", "user_id": 1}), 7).await?;
 //! queue.insert_data(json!({"event": "click", "path": "/home"}), 7).await?;
-//! 
+//!
 //! // Optionally force a flush (normally automatic by max_size/time)
 //! queue.sync_data().await;
 //! # Ok(())
 //! # }
 //! ```
 
+use crate::error::InsertionError;
+use deadpool::managed::Object;
+use deadpool_postgres::{Manager, Transaction};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -96,30 +99,20 @@ impl Queue {
     ///
     /// Errors:
     /// - Returns `Err(())` if the destination id does not exist.
-    pub async fn get_queue(
-        destination_id: i64,
+    pub fn get_queue(
+        id: i64,
         pool: deadpool_postgres::Pool,
         max_duration: Option<Duration>,
         max_size: Option<i16>,
-    ) -> Result<Arc<Queue>, ()> {
-        let client = pool.get().await.unwrap();
-        let stmt = client
-            .prepare_cached("SELECT id, destination_id FROM queue WHERE destination_id = $1")
-            .await
-            .unwrap();
-        let mut rows = client.query(&stmt, &[&destination_id]).await.unwrap();
-
-        match rows.pop() {
-            None => Err(()),
-            Some(row) => Ok(Arc::new(Queue {
-                id: row.get(0),
-                data: Default::default(),
-                max_duration: max_duration.unwrap_or(Duration::from_secs(10)),
-                sync_handle: Default::default(),
-                first_added_at: Mutex::new(None),
-                pool: pool.clone(),
-                max_size: max_size.unwrap_or(128),
-            })),
+    ) -> Self {
+        Queue {
+            id,
+            data: Default::default(),
+            max_duration: max_duration.unwrap_or(Duration::from_secs(10)),
+            sync_handle: Default::default(),
+            first_added_at: Mutex::new(None),
+            pool: pool.clone(),
+            max_size: max_size.unwrap_or(128),
         }
     }
 
@@ -128,17 +121,28 @@ impl Queue {
     /// Behavior:
     /// - If this is the first item in an empty buffer, starts a timed auto-sync.
     /// - If the buffer size exceeds `max_size`, triggers an immediate sync.
-    pub async fn insert_data(self: &Arc<Self>, data: Value, source_id: i64) -> Result<(), ()> {
-        let uuid = Uuid::new_v4();
+    pub async fn insert_data(
+        self: &Arc<Self>,
+        data: Vec<Value>,
+        source_id: i64,
+    ) -> Result<(), InsertionError> {
+        if data.len() > self.max_size as usize {
+            return Err(InsertionError::BufferOverflow(self.max_size));
+        }
+        if data.is_empty() {
+            return Err(InsertionError::EmptyData);
+        }
 
         let mut lock = self.data.lock().await;
-        lock.insert(uuid, (data, source_id));
 
-        if lock.len() == 1 {
-            // Start timer for time-based flush.
+        if lock.is_empty() {
             let _ = self.first_added_at.lock().await.insert(chrono::Utc::now());
             self.schedule_auto_sync().await;
-        } else if lock.len() > self.max_size as usize {
+        }
+
+        lock.extend(data.into_iter().map(|d| (Uuid::new_v4(), (d, source_id))));
+
+        if lock.len() >= self.max_size as usize {
             // Size-based flush when exceeding max_size.
             self.sync_data().await;
         }
@@ -286,7 +290,7 @@ impl Queue {
 
         job_writer.finish().await.unwrap();
 
-        // Release the reservation with actual inserted count
+        // Release the reservation with an actual inserted count
         tx.execute(
             "SELECT release_reservation($1, $2, $3)",
             &[&(self.id as i32), &dataset_id, &(data.len() as i32)],

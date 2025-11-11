@@ -12,7 +12,7 @@
 -- updating statuses for jobs, along with indexes to support scheduling.
 --
 -- Cleanup
- drop table if exists queue;
+drop table if exists queue;
 drop table if exists destination;
 do
 $$
