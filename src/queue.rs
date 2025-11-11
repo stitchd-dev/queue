@@ -55,9 +55,7 @@
 //! # }
 //! ```
 
-use crate::error::InsertionError;
-use deadpool::managed::Object;
-use deadpool_postgres::{Manager, Transaction};
+use crate::error::{InsertionError, SyncError};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -137,14 +135,17 @@ impl Queue {
 
         if lock.is_empty() {
             let _ = self.first_added_at.lock().await.insert(chrono::Utc::now());
-            self.schedule_auto_sync().await;
+            self.schedule_auto_sync(Some(self.max_duration)).await;
         }
 
         lock.extend(data.into_iter().map(|d| (Uuid::new_v4(), (d, source_id))));
 
         if lock.len() >= self.max_size as usize {
             // Size-based flush when exceeding max_size.
-            self.sync_data().await;
+            self.sync_data().await.map_err(|err| match err {
+                SyncError::Pool(e) => InsertionError::PoolError(e),
+                SyncError::DbError(e) => InsertionError::DbError(e),
+            })?;
         }
 
         Ok(())
@@ -154,22 +155,25 @@ impl Queue {
     async fn cancel_auto_sync(&self) {
         let mut sync_handle = self.sync_handle.lock().await;
         if let Some(handle) = sync_handle.take() {
-            let _ = handle.await;
+            let _ = handle.abort();
         }
     }
 
     /// Schedule an auto-sync to run after `max_duration` if data is still pending.
     ///
     /// Any previously scheduled auto-sync is first canceled to avoid duplicates.
-    async fn schedule_auto_sync(self: &Arc<Self>) {
+    ///
+    // TODO: Need to fix the concurrent running & abort problem.
+    async fn schedule_auto_sync(self: &Arc<Self>, duration: Option<Duration>) {
         // Cancel any existing scheduled sync
         self.cancel_auto_sync().await;
 
         let queue = Arc::clone(self);
-        let duration = self.max_duration.clone();
 
         let handle = tokio::spawn(async move {
-            tokio::time::sleep(duration).await;
+            if let Some(duration) = duration {
+                tokio::time::sleep(duration).await;
+            }
 
             // Check if there's still data to sync
             let has_data = {
@@ -178,7 +182,11 @@ impl Queue {
             };
 
             if has_data {
-                queue.sync_data().await;
+                let res = queue.sync_data().await;
+
+                if let Err(e) = res {
+                    tracing::error!("Failed to sync data.{}", e);
+                }
             }
         });
 
@@ -195,12 +203,9 @@ impl Queue {
     /// 4. COPY buffered rows into `queue_<id>_data_<dataset>` and corresponding job ids
     ///    into `queue_<id>_job_<dataset>`.
     /// 5. Call `release_reservation` with the actual inserted count, then commit.
-    pub async fn sync_data(&self) {
+    pub async fn sync_data(&self) -> Result<(), SyncError> {
         // Cancel any existing scheduled sync
         self.cancel_auto_sync().await;
-
-        let mut client = self.pool.get().await.unwrap();
-        let tx = client.transaction().await.unwrap();
 
         let data = {
             // Drain the buffer atomically to avoid losing entries on failure later.
@@ -214,10 +219,12 @@ impl Queue {
         };
 
         if data.is_empty() {
-            // Nothing to do, but we still commit the empty transaction for cleanliness.
-            tx.commit().await.unwrap();
-            return;
+            return Ok(());
         }
+
+        let mut client = self.pool.get().await?;
+
+        let tx = client.transaction().await?;
 
         // Get the current dataset
         let dataset_id: i32 = tx
@@ -229,8 +236,7 @@ impl Queue {
                     &(data.len() as i32),
                 ],
             )
-            .await
-            .unwrap()
+            .await?
             .get(0);
 
         let data_table_name = format!("queue_{}_data_{}", self.id, dataset_id);
@@ -242,8 +248,7 @@ impl Queue {
                 "COPY {} (id, data, source) FROM STDIN WITH (FORMAT binary)",
                 data_table_name
             ))
-            .await
-            .unwrap();
+            .await?;
 
         let data_writer = tokio_postgres::binary_copy::BinaryCopyInWriter::new(
             data_sink,
@@ -261,11 +266,10 @@ impl Queue {
             data_writer
                 .as_mut()
                 .write(&[uuid, json_data, source_id])
-                .await
-                .unwrap();
+                .await?;
         }
 
-        data_writer.finish().await.unwrap();
+        data_writer.finish().await?;
 
         // Use COPY to bulk insert into job table
         let job_sink = tx
@@ -273,8 +277,7 @@ impl Queue {
                 "COPY {} (data) FROM STDIN WITH (FORMAT binary)",
                 job_table_name
             ))
-            .await
-            .unwrap();
+            .await?;
 
         let job_writer = tokio_postgres::binary_copy::BinaryCopyInWriter::new(
             job_sink,
@@ -285,19 +288,20 @@ impl Queue {
 
         for uuid in data.keys() {
             // Write the job row referencing the data UUID.
-            job_writer.as_mut().write(&[uuid]).await.unwrap();
+            job_writer.as_mut().write(&[uuid]).await?;
         }
 
-        job_writer.finish().await.unwrap();
+        job_writer.finish().await?;
 
         // Release the reservation with an actual inserted count
         tx.execute(
             "SELECT release_reservation($1, $2, $3)",
             &[&(self.id as i32), &dataset_id, &(data.len() as i32)],
         )
-        .await
-        .unwrap();
+        .await?;
 
-        tx.commit().await.unwrap();
+        tx.commit().await?;
+
+        Ok(())
     }
 }

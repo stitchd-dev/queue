@@ -14,3 +14,5 @@ tokio-postgres = {version = "0.7.15", features = ["with-chrono-0_4", "with-uuid-
 uuid = {version = "1.18.1", features = ["serde", "v4"]}
 futures = "0.3.31"
 axum = "0.8.6"
+derive_more = {version = "2.0.1", features = ["from", "display", "error"]}
+tracing = "0.1.41"
