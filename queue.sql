@@ -215,4 +215,5 @@ end;
 $$ language plpgsql;
 
 -- Testing
-select * from create_queue();
+select *
+from create_queue();
