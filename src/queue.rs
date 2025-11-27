@@ -61,7 +61,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::error;
+use tracing::{debug, error};
 use uuid::Uuid;
 
 /// Batching queue that buffers JSON payloads in-memory and flushes to PostgreSQL.
@@ -71,7 +71,7 @@ pub struct Queue {
     /// Database identifier of this queue (primary key of `queue` table).
     id: i32,
     /// In-memory buffer mapping UUID -> (JSON payload, source id).
-    data: Mutex<HashMap<Uuid, Value>>,
+    data: Mutex<Vec<Value>>,
     /// Maximum time to wait since the first item was added before auto-flushing.
     max_duration: Duration,
     /// Handle to a scheduled background task that will run a timed sync.
@@ -79,7 +79,9 @@ pub struct Queue {
     /// Connection pool used for database operations.
     pool: deadpool_postgres::Pool,
     /// Number of buffered items that triggers an immediate sync when exceeded.
-    max_size: usize,
+    max_buffer_size: usize,
+    /// Max Insertion Allowed Size
+    max_insertion_allowed_size: usize,
 }
 
 impl Queue {
@@ -100,15 +102,19 @@ impl Queue {
         id: i32,
         pool: deadpool_postgres::Pool,
         max_duration: Option<Duration>,
-        max_size: Option<u16>,
+        max_size: Option<usize>,
+        max_insertion_allowed_size: Option<usize>,
     ) -> Self {
+        let max_buffer_size = max_size.map(|s| s).unwrap_or(128);
+
         Queue {
             id,
             data: Default::default(),
             max_duration: max_duration.unwrap_or(Duration::from_secs(10)),
             sync_handle: Default::default(),
             pool: pool.clone(),
-            max_size: max_size.map(|s| s as usize).unwrap_or(128),
+            max_buffer_size,
+            max_insertion_allowed_size: max_insertion_allowed_size.unwrap_or(128 * 2),
         }
     }
 
@@ -118,11 +124,22 @@ impl Queue {
     /// - If this is the first item in an empty buffer, starts a timed auto-sync.
     /// - If the buffer size exceeds `max_size`, triggers an immediate sync.
     pub async fn insert_data(self: &Arc<Self>, data: Vec<Value>) -> Result<(), InsertionError> {
-        if data.len() > self.max_size {
-            return Err(InsertionError::BufferOverflow(self.max_size));
-        }
-        if data.is_empty() {
+        let len = data.len();
+
+        if len > self.max_insertion_allowed_size {
+            return Err(InsertionError::LimitExceeded(
+                self.max_insertion_allowed_size,
+            ));
+        } else if len == 0 {
             return Err(InsertionError::EmptyData);
+        } else if len >= self.max_buffer_size {
+            let queue = self.clone();
+
+            if let Err(err) = queue.send_data_to_pg(data).await {
+                error!("Sending to PG Failed : {}", err);
+            }
+
+            return Ok(());
         }
 
         let length = {
@@ -132,19 +149,15 @@ impl Queue {
                 self.schedule_auto_sync().await;
             }
 
-            lock.extend(data.into_iter().map(|d| (Uuid::new_v4(), d)));
+            lock.extend(data);
 
             lock.len()
         };
 
-        if length >= self.max_size {
-            let queue = self.clone();
-            // Size-based flush when exceeding max_size.
-            tokio::spawn(async move {
-                if let Err(err) = queue.sync_data().await {
-                    error!("Error during auto-sync: {}", err);
-                }
-            });
+        if length >= self.max_buffer_size {
+            if let Err(err) = self.sync_data().await {
+                error!("Error during auto-sync: {}", err);
+            }
         }
 
         Ok(())
@@ -171,6 +184,7 @@ impl Queue {
 
         *sync_handle = Some(tokio::spawn(async move {
             tokio::time::sleep(queue.max_duration).await;
+            debug!("Running auto sync");
 
             tokio::spawn(async move {
                 if let Err(err) = queue.sync_data().await {
@@ -190,17 +204,23 @@ impl Queue {
     ///    into `queue_<id>_job_<dataset>`.
     /// 5. Call `release_reservation` with the actual inserted count, then commit.
     pub async fn sync_data(&self) -> Result<(), SyncError> {
+        debug!("Syncing Buffer Data");
         // Drain the buffer atomically to avoid losing entries on failure later.
         let data = {
             let mut lock = self.data.lock().await;
             self.cancel_auto_sync().await;
-            lock.drain().collect::<HashMap<_, _>>()
+            lock.drain(..).collect::<Vec<_>>()
         };
 
         if data.is_empty() {
             return Ok(());
         }
 
+        self.send_data_to_pg(data).await
+    }
+
+    async fn send_data_to_pg(&self, data: Vec<Value>) -> Result<(), SyncError> {
+        debug!("Sending data to PG.");
         let mut client = self.pool.get().await?;
 
         let tx = client.transaction().await?;
@@ -234,6 +254,11 @@ impl Queue {
         );
 
         futures::pin_mut!(data_writer);
+
+        let data = data
+            .into_iter()
+            .map(|v| (Uuid::new_v4(), v))
+            .collect::<HashMap<_, _>>();
 
         for (uuid, json_data) in &data {
             // Write one data row: (uuid, jsonb payload, BIGINT source id)

@@ -3,9 +3,8 @@ use derive_more::with_trait::{Display, Error, From};
 
 #[derive(From, Debug, Display)]
 pub enum InsertionError {
-    QueueNotFound,
     // value will be max_size allowed
-    BufferOverflow(usize),
+    LimitExceeded(usize),
     EmptyData,
 }
 
