@@ -5,17 +5,13 @@ use derive_more::with_trait::{Display, Error, From};
 pub enum InsertionError {
     QueueNotFound,
     // value will be max_size allowed
-    BufferOverflow(i16),
+    BufferOverflow(usize),
     EmptyData,
-    PoolError(PoolError),
-    DbError(tokio_postgres::error::Error),
 }
 
 impl Error for InsertionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            InsertionError::PoolError(e) => Some(e),
-            InsertionError::DbError(e) => Some(e),
             _ => None,
         }
     }

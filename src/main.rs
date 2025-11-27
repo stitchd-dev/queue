@@ -7,12 +7,13 @@
 
 mod error;
 pub mod queue;
-pub mod state;
 
-use crate::state::State;
+use crate::queue::Queue;
 use deadpool::Runtime;
 use deadpool_postgres::tokio_postgres::NoTls;
 use deadpool_postgres::{Config, ManagerConfig, RecyclingMethod};
+use serde_json::json;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
@@ -31,36 +32,22 @@ async fn main() {
 
     let pool = config.create_pool(Some(Runtime::Tokio1), NoTls).unwrap();
 
-    let state = State::init(pool, 100, std::time::Duration::from_secs(10))
-        .await
-        .unwrap();
+    let queue = Queue::get_queue(1, pool, Some(core::time::Duration::from_secs(2)), Some(4));
 
-    let destination_id = state
-        .add_destination(
-            "test".to_string(),
-            "test".to_string(),
-            serde_json::json!({}),
-        )
-        .await
-        .unwrap();
-
-    println!("Destination {}", destination_id);
-
-    let source_id = state
-        .add_source("test".to_string(), "test".to_string())
-        .await
-        .unwrap();
-
-    println!("Source {}", source_id);
-
-    state
-        .add_data(
-            destination_id,
-            vec![serde_json::json!({"a": 1}), serde_json::json!({"b": 2})],
-            source_id,
-        )
-        .await
-        .unwrap();
+    let queue = Arc::new(queue);
+    queue.insert_data(vec![json!({
+        "a":1
+    }),
+                           json!({
+        "a":2
+    }),
+                           json!({
+        "a":3
+    }),
+                           json!({
+        "a":4
+    })
+    ]).await;
 
     tokio::time::sleep(std::time::Duration::from_secs(20)).await;
 }

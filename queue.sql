@@ -52,37 +52,19 @@ drop type if exists failed_job_update;
 drop type if exists job_status;
 
 -- Setup
-create table destination
-(
-    id     serial primary key,
-    name   varchar(255) not null,
-    type   varchar(255) not null,
-    config jsonb
-);
-
-create table source
-(
-    id   serial primary key,
-    name varchar(255) not null,
-    type varchar(255) not null
-);
-
 create table queue
 (
     id                  serial primary key,
-    destination_id      int references destination (id) not null,
-    created_at          timestamp                       not null default now(),
-    updated_at          timestamp                       not null default now(),
-    reserved_slots      int                             not null default 0,
-    current_dataset     int                             not null default 0
+    created_at          timestamp not null default now(),
+    updated_at          timestamp not null default now(),
+    reserved_slots      int       not null default 0,
+    current_dataset     int       not null default 0
         constraint queue_current_dataset_check check (current_dataset >= 0),
-    processing_dataset  int                             not null default 0
+    processing_dataset  int       not null default 0
         constraint queue_processing_dataset_check check ( processing_dataset >= 0 and processing_dataset <= current_dataset ),
-    last_failed_dataset int                             not null default 0
+    last_failed_dataset int       not null default 0
         constraint queue_last_failed_dataset_check check ( last_failed_dataset >= 0 and last_failed_dataset <= processing_dataset )
 );
-
-create index queue_destination_id_idx on queue (destination_id);
 
 create type job_status as enum ('pending', 'processing', 'failed', 'done', 'failed_permanently');
 
@@ -103,8 +85,7 @@ begin
     execute format(
             'create table %I (
                 id     uuid primary key,
-                data   jsonb not null,
-                source int references source (id) not null
+                data   jsonb not null
             )',
             data_table_name);
     execute format(
@@ -125,19 +106,17 @@ begin
 end;
 $$ language plpgsql;
 
-create or replace function add_destination(name varchar(255), type varchar(255), config jsonb) returns int as
+create or replace function create_queue() returns int as
 $$
 declare
-    destination_id int;
-    queue_id       int;
-    dataset_id     int;
+    queue_id   int;
+    dataset_id int;
 begin
-    insert into destination (name, type, config) values (name, type, config) returning id into destination_id;
-    insert into queue (destination_id) values (destination_id) returning id, current_dataset into queue_id, dataset_id;
+    insert into queue default values returning id, current_dataset into queue_id, dataset_id;
 
     perform create_dataset(queue_id, dataset_id);
 
-    return destination_id;
+    return queue_id;
 end;
 $$ language plpgsql;
 
@@ -188,11 +167,11 @@ $$ language plpgsql;
 create or replace function get_current_dataset(queue_id int, expected_insertion_size int) returns int as
 $$
 declare
-    threshold      int;
-    dataset        int;
+    threshold              int;
+    dataset                int;
     current_reserved_slots int;
-    job_table_name text;
-    count          int;
+    job_table_name         text;
+    count                  int;
 begin
     -- max partition size as 100k
     threshold := 100000;
@@ -234,3 +213,6 @@ begin
       and current_dataset = dataset_id;
 end;
 $$ language plpgsql;
+
+-- Testing
+select * from create_queue();

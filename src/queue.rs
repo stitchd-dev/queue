@@ -1,7 +1,7 @@
 //! Queue module
 //!
 //! This module implements an in-memory buffering queue that batches JSON payloads
-//! and periodically flushes them into PostgreSQL using efficient binary `COPY`.
+//! and periodically flushes them into PostgreSQL using the efficient binary ` COPY `.
 //! The queue supports two triggers for a flush ("sync"):
 //! - size-based: when the number of buffered items exceeds `max_size`
 //! - time-based: when `max_duration` elapses since the first item was added
@@ -61,6 +61,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tracing::error;
 use uuid::Uuid;
 
 /// Batching queue that buffers JSON payloads in-memory and flushes to PostgreSQL.
@@ -70,17 +71,15 @@ pub struct Queue {
     /// Database identifier of this queue (primary key of `queue` table).
     id: i32,
     /// In-memory buffer mapping UUID -> (JSON payload, source id).
-    data: Mutex<HashMap<Uuid, (Value, i32)>>,
+    data: Mutex<HashMap<Uuid, Value>>,
     /// Maximum time to wait since the first item was added before auto-flushing.
     max_duration: Duration,
     /// Handle to a scheduled background task that will run a timed sync.
     sync_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Timestamp when the first item was added to an empty buffer; used for timing.
-    first_added_at: Mutex<Option<chrono::DateTime<chrono::Utc>>>,
     /// Connection pool used for database operations.
     pool: deadpool_postgres::Pool,
     /// Number of buffered items that triggers an immediate sync when exceeded.
-    max_size: i16,
+    max_size: usize,
 }
 
 impl Queue {
@@ -101,16 +100,15 @@ impl Queue {
         id: i32,
         pool: deadpool_postgres::Pool,
         max_duration: Option<Duration>,
-        max_size: Option<i16>,
+        max_size: Option<u16>,
     ) -> Self {
         Queue {
             id,
             data: Default::default(),
             max_duration: max_duration.unwrap_or(Duration::from_secs(10)),
             sync_handle: Default::default(),
-            first_added_at: Mutex::new(None),
             pool: pool.clone(),
-            max_size: max_size.unwrap_or(128),
+            max_size: max_size.map(|s| s as usize).unwrap_or(128),
         }
     }
 
@@ -119,12 +117,8 @@ impl Queue {
     /// Behavior:
     /// - If this is the first item in an empty buffer, starts a timed auto-sync.
     /// - If the buffer size exceeds `max_size`, triggers an immediate sync.
-    pub async fn insert_data(
-        self: &Arc<Self>,
-        data: Vec<Value>,
-        source_id: i32,
-    ) -> Result<(), InsertionError> {
-        if data.len() > self.max_size as usize {
+    pub async fn insert_data(self: &Arc<Self>, data: Vec<Value>) -> Result<(), InsertionError> {
+        if data.len() > self.max_size {
             return Err(InsertionError::BufferOverflow(self.max_size));
         }
         if data.is_empty() {
@@ -135,21 +129,22 @@ impl Queue {
             let mut lock = self.data.lock().await;
 
             if lock.is_empty() {
-                let _ = self.first_added_at.lock().await.insert(chrono::Utc::now());
-                self.schedule_auto_sync(Some(self.max_duration)).await;
+                self.schedule_auto_sync().await;
             }
 
-            lock.extend(data.into_iter().map(|d| (Uuid::new_v4(), (d, source_id))));
+            lock.extend(data.into_iter().map(|d| (Uuid::new_v4(), d)));
 
             lock.len()
         };
 
-        if length >= self.max_size as usize {
+        if length >= self.max_size {
+            let queue = self.clone();
             // Size-based flush when exceeding max_size.
-            self.sync_data().await.map_err(|err| match err {
-                SyncError::Pool(e) => InsertionError::PoolError(e),
-                SyncError::DbError(e) => InsertionError::DbError(e),
-            })?;
+            tokio::spawn(async move {
+                if let Err(err) = queue.sync_data().await {
+                    error!("Error during auto-sync: {}", err);
+                }
+            });
         }
 
         Ok(())
@@ -166,56 +161,40 @@ impl Queue {
     /// Schedule an auto-sync to run after `max_duration` if data is still pending.
     ///
     /// Any previously scheduled auto-sync is first canceled to avoid duplicates.
-    ///
-    // TODO: Need to fix the concurrent running & abort problem.
-    async fn schedule_auto_sync(self: &Arc<Self>, duration: Option<Duration>) {
+    async fn schedule_auto_sync(self: &Arc<Self>) {
         // Cancel any existing scheduled sync
         self.cancel_auto_sync().await;
 
         let queue = Arc::clone(self);
 
-        let handle = tokio::spawn(async move {
-            if let Some(duration) = duration {
-                tokio::time::sleep(duration).await;
-            }
-
-            // Check if there's still data to sync
-            let has_data = {
-                let lock = queue.data.lock().await;
-                !lock.is_empty()
-            };
-
-            if has_data {
-                let res = queue.sync_data().await;
-
-                if let Err(e) = res {
-                    tracing::error!("Failed to sync data.{}", e);
-                }
-            }
-        });
-
         let mut sync_handle = self.sync_handle.lock().await;
-        *sync_handle = Some(handle);
+
+        *sync_handle = Some(tokio::spawn(async move {
+            tokio::time::sleep(queue.max_duration).await;
+
+            tokio::spawn(async move {
+                if let Err(err) = queue.sync_data().await {
+                    error!("Failed to sync data.{}", err);
+                }
+            });
+        }));
     }
 
-    /// Flush buffered data to PostgreSQL using binary `COPY` inside a transaction.
+    /// Flush buffered data to PostgreSQL using the binary ` COPY ` inside a transaction.
     ///
     /// Steps:
     /// 1. Cancel any pending auto-sync (to avoid duplicate flushes).
-    /// 2. Drain the in-memory buffer and clear timing state.
+    /// 2. Drain the in-memory buffer and clear the timing state.
     /// 3. Get a dataset id via `get_current_dataset` to decide the target tables.
     /// 4. COPY buffered rows into `queue_<id>_data_<dataset>` and corresponding job ids
     ///    into `queue_<id>_job_<dataset>`.
     /// 5. Call `release_reservation` with the actual inserted count, then commit.
     pub async fn sync_data(&self) -> Result<(), SyncError> {
+        // Drain the buffer atomically to avoid losing entries on failure later.
         let data = {
-            // Drain the buffer atomically to avoid losing entries on failure later.
-            let data = self.data.lock().await.drain().collect::<HashMap<_, _>>();
-
-            // Reset timing since the buffer is now empty.
-            let _ = self.first_added_at.lock().await.take();
-
-            data
+            let mut lock = self.data.lock().await;
+            self.cancel_auto_sync().await;
+            lock.drain().collect::<HashMap<_, _>>()
         };
 
         if data.is_empty() {
@@ -241,7 +220,7 @@ impl Queue {
         // Use COPY to bulk insert into data table
         let data_sink = tx
             .copy_in(&format!(
-                "COPY {} (id, data, source) FROM STDIN WITH (FORMAT binary)",
+                "COPY {} (id, data) FROM STDIN WITH (FORMAT binary)",
                 data_table_name
             ))
             .await?;
@@ -251,18 +230,14 @@ impl Queue {
             &[
                 tokio_postgres::types::Type::UUID,
                 tokio_postgres::types::Type::JSONB,
-                tokio_postgres::types::Type::INT4,
             ],
         );
 
         futures::pin_mut!(data_writer);
 
-        for (uuid, (json_data, source_id)) in &data {
+        for (uuid, json_data) in &data {
             // Write one data row: (uuid, jsonb payload, BIGINT source id)
-            data_writer
-                .as_mut()
-                .write(&[uuid, json_data, source_id])
-                .await?;
+            data_writer.as_mut().write(&[uuid, json_data]).await?;
         }
 
         data_writer.finish().await?;
