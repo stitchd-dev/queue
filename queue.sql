@@ -55,14 +55,14 @@ drop type if exists job_status;
 create table queue
 (
     id                  serial primary key,
-    created_at          timestamp not null default now(),
-    updated_at          timestamp not null default now(),
-    reserved_slots      int       not null default 0,
-    current_dataset     int       not null default 0
+    created_at          timestamptz not null default now(),
+    updated_at          timestamptz not null default now(),
+    reserved_slots      int         not null default 0,
+    current_dataset     int         not null default 0
         constraint queue_current_dataset_check check (current_dataset >= 0),
-    processing_dataset  int       not null default 0
+    processing_dataset  int         not null default 0
         constraint queue_processing_dataset_check check ( processing_dataset >= 0 and processing_dataset <= current_dataset ),
-    last_failed_dataset int       not null default 0
+    last_failed_dataset int         not null default 0
         constraint queue_last_failed_dataset_check check ( last_failed_dataset >= 0 and last_failed_dataset <= processing_dataset )
 );
 
@@ -93,10 +93,10 @@ begin
                 id         serial primary key,
                 status     job_status not null default ''pending'',
                 data       uuid not null,
-                try_at     timestamp not null default now(),
+                try_at     timestamptz not null default now(),
                 retry_count int not null default 0,
-                created_at timestamp not null default now(),
-                updated_at timestamp not null default now()
+                created_at timestamptz not null default now(),
+                updated_at timestamptz not null default now()
             )',
             job_table_name, data_table_name);
 
@@ -123,7 +123,7 @@ $$ language plpgsql;
 create type failed_job_update as
 (
     id          int,
-    try_at      timestamp,
+    try_at      timestamptz,
     retry_count int
 );
 
@@ -159,7 +159,7 @@ begin
                     try_at = f.try_at,
                     retry_count = f.retry_count
                 from unnest($1) as f where %I.id = f.id',
-                table_name) using failed_jobs;
+                table_name, table_name) using failed_jobs;
     end if;
 end;
 $$ language plpgsql;

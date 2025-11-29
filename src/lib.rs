@@ -14,7 +14,7 @@ pub struct Error {
 
 #[derive(Debug)]
 struct FailedJobUpdate {
-    id: Uuid,
+    id: i32,
     try_at: DateTime<Utc>,
     retry_count: i32,
 }
@@ -51,7 +51,7 @@ impl ToSql for FailedJobUpdate {
         out.put_i32(3);
 
         // Write each field
-        write_field(&self.id, &Type::UUID, out)?;
+        write_field(&self.id, &Type::INT4, out)?;
         write_field(&self.try_at, &Type::TIMESTAMPTZ, out)?;
         write_field(&self.retry_count, &Type::INT4, out)?;
 
@@ -94,7 +94,7 @@ pub trait EventProcessor: Send + Sync {
 
     fn queue_id() -> i32;
 
-    fn concurrent_processing_limit() -> i32;
+    fn concurrent_processing_limit() -> i64;
 
     fn processing_timeout() -> chrono::Duration;
 
@@ -109,7 +109,7 @@ pub trait EventProcessor: Send + Sync {
         loop {
             let row = conn
                 .query_one(
-                    "SELECT processing_dataset, current_dataset FROM events WHERE queue_id = $1",
+                    "SELECT processing_dataset, current_dataset FROM queue WHERE id = $1",
                     &[&queue_id],
                 )
                 .await
@@ -122,14 +122,14 @@ pub trait EventProcessor: Send + Sync {
             let transaction = conn.transaction().await.unwrap();
             let jobs = transaction
                 .query(
-                    &format!("SELECT data, status, retry_count, try_at FROM {} WHERE status = 'pending' for update skip locked limit $1", job_table_name),
+                    &format!("SELECT id, data, retry_count, try_at FROM {} WHERE status = 'pending' for update skip locked limit $1", job_table_name),
                     &[&Self::concurrent_processing_limit()],
                 )
                 .await
                 .unwrap()
                 .iter()
                 .map(|row| (row.get(0), (row.get(1), row.get(2), row.get(3))))
-                .collect::<HashMap<Uuid, (String, i32, DateTime<chrono::Utc>)>>();
+                .collect::<HashMap<i32, (Uuid, i32, DateTime<Utc>)>>();
 
             transaction
                 .query(
@@ -155,40 +155,50 @@ pub trait EventProcessor: Send + Sync {
                     }
                 }
             } else {
-                let ids = jobs.keys().collect::<Vec<_>>();
+                let data_uuids: Vec<Uuid> = jobs.values().map(|(uuid, _, _)| *uuid).collect();
+
                 let events = conn
                     .query(
                         &format!(
                             "SELECT id, data FROM {} WHERE id = any($1)",
                             data_table_name
                         ),
-                        &[&data_table_name, &ids],
+                        &[&data_uuids],
                     )
                     .await
                     .unwrap()
                     .iter()
-                    .map(|row| (row.get(0), row.get(1)))
+                    .map(|row| {
+                        let uuid: Uuid = row.get(0);
+                        let data: Value = row.get(1);
+                        (uuid, data)
+                    })
                     .collect::<HashMap<Uuid, Value>>();
 
                 let results = futures::future::join_all(
-                    events
-                        .into_iter()
-                        .map(async |(key, v)| (key, Self::process(v).await)),
+                    jobs
+                        .iter()
+                        .map(|(job_id, (data_uuid, _, _))| {
+                            let event_data = events.get(data_uuid).cloned().unwrap();
+                            async move {
+                                (*job_id, Self::process(event_data).await)
+                            }
+                        })
                 )
                 .await;
 
-                let mut done_jobs: Vec<Uuid> = Vec::new();
-                let mut permanently_failed_jobs: Vec<Uuid> = Vec::new();
+                let mut done_jobs: Vec<i32> = Vec::new();
+                let mut permanently_failed_jobs: Vec<i32> = Vec::new();
                 let mut failed_jobs: Vec<FailedJobUpdate> = Vec::new();
 
                 for (id, res) in results {
                     match res {
                         Ok(_) => done_jobs.push(id),
                         Err(_) => {
-                            let status = jobs.get(&id).unwrap();
+                            let (_, current_retry_count, _) = jobs.get(&id).unwrap();
 
-                            if status.1 < Self::max_retry_allowed() {
-                                let retry_count = status.1 + 1;
+                            if *current_retry_count < Self::max_retry_allowed() {
+                                let retry_count = current_retry_count + 1;
                                 failed_jobs.push(FailedJobUpdate {
                                     id,
                                     try_at: Self::get_retry_at(retry_count),
@@ -202,7 +212,7 @@ pub trait EventProcessor: Send + Sync {
                 }
 
                 conn.query(
-                    "PERFORM update_status($1, $2, $3, $4, $5)",
+                    "SELECT update_status($1, $2, $3, $4, $5)",
                     &[
                         &queue_id,
                         &current_dataset,
@@ -235,19 +245,21 @@ mod tests {
 
         async fn process(event: Value) -> Result<(), Error> {
             println!("Processing event: {:?}", event);
-            Ok(())
+            Err(Error {
+                message: "Mock error".to_string(),
+            })
         }
 
         fn queue_id() -> i32 {
             1
         }
 
-        fn concurrent_processing_limit() -> i32 {
+        fn concurrent_processing_limit() -> i64 {
             10
         }
 
         fn processing_timeout() -> chrono::Duration {
-            chrono::Duration::seconds(5)
+            chrono::Duration::seconds(30)
         }
 
         fn max_retry_allowed() -> i32 {
@@ -255,7 +267,7 @@ mod tests {
         }
 
         fn get_retry_at(retry_count: i32) -> DateTime<Utc> {
-            Utc::now() + chrono::Duration::seconds(5 * (retry_count as i64))
+            Utc::now() + chrono::Duration::seconds(2)
         }
     }
 
