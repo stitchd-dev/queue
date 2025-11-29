@@ -123,8 +123,7 @@ $$ language plpgsql;
 create type failed_job_update as
 (
     id          int,
-    try_at      timestamptz,
-    retry_count int
+    try_at      timestamptz
 );
 
 create or replace function update_status(queue_id int, dataset_id int, done_jobs int[],
@@ -156,8 +155,7 @@ begin
                 'update %I set
                     status = ''failed'',
                     updated_at = now(),
-                    try_at = f.try_at,
-                    retry_count = f.retry_count
+                    try_at = f.try_at
                 from unnest($1) as f where %I.id = f.id',
                 table_name, table_name) using failed_jobs;
     end if;

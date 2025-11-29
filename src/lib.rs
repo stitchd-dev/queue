@@ -16,7 +16,6 @@ pub struct Error {
 struct FailedJobUpdate {
     id: i32,
     try_at: DateTime<Utc>,
-    retry_count: i32,
 }
 
 fn write_field<T: ToSql>(
@@ -48,12 +47,11 @@ impl ToSql for FailedJobUpdate {
         // Convert the struct to a tuple format that matches the PostgreSQL composite type
 
         // Write the number of fields
-        out.put_i32(3);
+        out.put_i32(2);
 
         // Write each field
         write_field(&self.id, &Type::INT4, out)?;
         write_field(&self.try_at, &Type::TIMESTAMPTZ, out)?;
-        write_field(&self.retry_count, &Type::INT4, out)?;
 
         Ok(IsNull::No)
     }
@@ -67,28 +65,62 @@ impl ToSql for FailedJobUpdate {
 
 pub struct EventProcessHandler {
     pub processing_handle: JoinHandle<()>,
+    pub failed_events_processing_handle: JoinHandle<()>,
+    pub dataset_cleanup_handle: JoinHandle<()>,
+    pub failed_dataset_compaction: JoinHandle<()>,
 }
 
 #[async_trait::async_trait]
 pub trait EventProcessor: Send + Sync {
     fn start(pool: Pool) -> EventProcessHandler {
-        let pool_clone = pool.clone();
+        let pool_processing = pool.clone();
         let processing_handle = tokio::spawn(async move {
             loop {
-                Self::process_pending_events(&pool_clone).await;
+                Self::process_pending_events(&pool_processing).await;
 
                 tokio::time::sleep(Self::delay_for_processing_post_exhaustion()).await;
             }
         });
 
-        // TODO: Cleanup dataset scheduler
-        // TODO: Failed Event Processing
-        // TODO: Failed dataset compaction job
+        let pool_cleanup = pool.clone();
 
-        EventProcessHandler { processing_handle }
+        let dataset_cleanup_handle = tokio::spawn(async move {
+            loop {
+                Self::cleanup_processed_datasets(&pool_cleanup).await;
+
+                tokio::time::sleep(Self::delay_for_dataset_cleanup()).await;
+            }
+        });
+
+        let pool_failed_events = pool.clone();
+        let failed_events_processing_handle = tokio::spawn(async move {
+            loop {
+                Self::processing_failed_events(&pool_failed_events).await;
+
+                tokio::time::sleep(Self::delay_for_failed_events_processing()).await;
+            }
+        });
+
+        let failed_dataset_compaction = tokio::spawn(async move {
+            loop {
+                Self::failed_dataset_compaction(&pool).await;
+
+                tokio::time::sleep(Self::delay_for_dataset_compaction_process()).await;
+            }
+        });
+
+        EventProcessHandler {
+            processing_handle,
+            failed_events_processing_handle,
+            dataset_cleanup_handle,
+            failed_dataset_compaction,
+        }
     }
 
     fn delay_for_processing_post_exhaustion() -> Duration;
+    fn delay_for_dataset_compaction_process() -> Duration;
+    fn delay_for_failed_events_processing() -> Duration;
+    fn delay_for_dataset_cleanup() -> Duration;
 
     async fn process(event: Value) -> Result<(), Error>;
 
@@ -96,11 +128,23 @@ pub trait EventProcessor: Send + Sync {
 
     fn concurrent_processing_limit() -> i64;
 
-    fn processing_timeout() -> chrono::Duration;
+    fn processing_timeout() -> Duration;
 
     fn max_retry_allowed() -> i32;
 
     fn get_retry_at(retry_count: i32) -> DateTime<Utc>;
+
+    async fn processing_failed_events(pool: &Pool) {
+        todo!()
+    }
+
+    async fn cleanup_processed_datasets(pool: &Pool) {
+        todo!()
+    }
+
+    async fn failed_dataset_compaction(pool: &Pool) {
+        todo!()
+    }
 
     async fn process_pending_events(pool: &Pool) {
         let queue_id = Self::queue_id();
@@ -122,25 +166,25 @@ pub trait EventProcessor: Send + Sync {
             let transaction = conn.transaction().await.unwrap();
             let jobs = transaction
                 .query(
-                    &format!("SELECT id, data, retry_count, try_at FROM {} WHERE status = 'pending' for update skip locked limit $1", job_table_name),
+                    &format!("SELECT id, data, try_at FROM {} WHERE status = 'pending' for update skip locked limit $1", job_table_name),
                     &[&Self::concurrent_processing_limit()],
                 )
                 .await
                 .unwrap()
                 .iter()
-                .map(|row| (row.get(0), (row.get(1), row.get(2), row.get(3))))
-                .collect::<HashMap<i32, (Uuid, i32, DateTime<Utc>)>>();
+                .map(|row| (row.get(0), (row.get(1), row.get(2))))
+                .collect::<HashMap<i32, (Uuid, DateTime<Utc>)>>();
 
-            transaction
+            let retry_data = transaction
                 .query(
                     &format!(
-                        "UPDATE {} SET status = 'processing', try_at = $1, updated_at = now() WHERE id = any($2)",
+                        "UPDATE {} SET status = 'processing', retry_count = retry_count+1, try_at = $1, updated_at = now() WHERE id = any($2) RETURNING id, retry_count",
                         job_table_name
                     ),
                     &[&(Utc::now() + Self::processing_timeout()), &jobs.keys().collect::<Vec<_>>()],
                 )
                 .await
-                .unwrap();
+                .unwrap().iter().map(|row| (row.get(0), row.get(1))).collect::<HashMap<i32, i32>>();
 
             transaction.commit().await.unwrap();
 
@@ -155,7 +199,7 @@ pub trait EventProcessor: Send + Sync {
                     }
                 }
             } else {
-                let data_uuids: Vec<Uuid> = jobs.values().map(|(uuid, _, _)| *uuid).collect();
+                let data_uuids: Vec<Uuid> = jobs.values().map(|(uuid, _)| *uuid).collect();
 
                 let events = conn
                     .query(
@@ -175,17 +219,12 @@ pub trait EventProcessor: Send + Sync {
                     })
                     .collect::<HashMap<Uuid, Value>>();
 
-                let results = futures::future::join_all(
-                    jobs
-                        .iter()
-                        .map(|(job_id, (data_uuid, _, _))| {
-                            let event_data = events.get(data_uuid).cloned().unwrap();
-                            async move {
-                                (*job_id, Self::process(event_data).await)
-                            }
-                        })
-                )
-                .await;
+                let results =
+                    futures::future::join_all(jobs.iter().map(|(job_id, (data_uuid, _))| {
+                        let event_data = events.get(data_uuid).cloned().unwrap();
+                        async move { (*job_id, Self::process(event_data).await) }
+                    }))
+                    .await;
 
                 let mut done_jobs: Vec<i32> = Vec::new();
                 let mut permanently_failed_jobs: Vec<i32> = Vec::new();
@@ -195,14 +234,12 @@ pub trait EventProcessor: Send + Sync {
                     match res {
                         Ok(_) => done_jobs.push(id),
                         Err(_) => {
-                            let (_, current_retry_count, _) = jobs.get(&id).unwrap();
+                            let retry_count = *retry_data.get(&id).unwrap();
 
-                            if *current_retry_count < Self::max_retry_allowed() {
-                                let retry_count = current_retry_count + 1;
+                            if retry_count <= Self::max_retry_allowed() {
                                 failed_jobs.push(FailedJobUpdate {
                                     id,
                                     try_at: Self::get_retry_at(retry_count),
-                                    retry_count,
                                 });
                             } else {
                                 permanently_failed_jobs.push(id);
@@ -242,12 +279,19 @@ mod tests {
         fn delay_for_processing_post_exhaustion() -> Duration {
             Duration::from_secs(1)
         }
+        fn delay_for_dataset_compaction_process() -> Duration {
+            Duration::from_secs(1)
+        }
+        fn delay_for_failed_events_processing() -> Duration {
+            Duration::from_secs(1)
+        }
+        fn delay_for_dataset_cleanup() -> Duration {
+            Duration::from_secs(1)
+        }
 
         async fn process(event: Value) -> Result<(), Error> {
             println!("Processing event: {:?}", event);
-            Err(Error {
-                message: "Mock error".to_string(),
-            })
+            Ok(())
         }
 
         fn queue_id() -> i32 {
@@ -258,16 +302,16 @@ mod tests {
             10
         }
 
-        fn processing_timeout() -> chrono::Duration {
-            chrono::Duration::seconds(30)
+        fn processing_timeout() -> Duration {
+            Duration::from_secs(3)
         }
 
         fn max_retry_allowed() -> i32 {
             3
         }
 
-        fn get_retry_at(retry_count: i32) -> DateTime<Utc> {
-            Utc::now() + chrono::Duration::seconds(2)
+        fn get_retry_at(_: i32) -> DateTime<Utc> {
+            Utc::now() + Duration::from_secs(2)
         }
     }
 
@@ -288,7 +332,7 @@ mod tests {
         let pool = config.create_pool(Some(Runtime::Tokio1), NoTls).unwrap();
         let handler = MockEventProcessor::start(pool);
 
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
         handler.processing_handle.abort();
     }
 }
