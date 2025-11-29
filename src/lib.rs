@@ -4,6 +4,7 @@ use deadpool_postgres::Pool;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Duration;
+use tokio::task::JoinHandle;
 use tokio_postgres::types::{IsNull, ToSql, Type};
 use uuid::Uuid;
 
@@ -64,11 +65,15 @@ impl ToSql for FailedJobUpdate {
     tokio_postgres::types::to_sql_checked!();
 }
 
+pub struct EventProcessHandler {
+    pub processing_handle: JoinHandle<()>,
+}
+
 #[async_trait::async_trait]
 pub trait EventProcessor: Send + Sync {
-    async fn start(pool: Pool) {
-        let pool_clone =  pool.clone();
-        tokio::spawn(async move {
+    fn start(pool: Pool) -> EventProcessHandler {
+        let pool_clone = pool.clone();
+        let processing_handle = tokio::spawn(async move {
             loop {
                 Self::process_pending_events(&pool_clone).await;
 
@@ -79,6 +84,8 @@ pub trait EventProcessor: Send + Sync {
         // TODO: Cleanup dataset scheduler
         // TODO: Failed Event Processing
         // TODO: Failed dataset compaction job
+
+        EventProcessHandler { processing_handle }
     }
 
     fn delay_for_processing_post_exhaustion() -> Duration;
@@ -208,5 +215,68 @@ pub trait EventProcessor: Send + Sync {
                 .unwrap();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deadpool::Runtime;
+    use deadpool_postgres::{Config, ManagerConfig, RecyclingMethod};
+    use tokio_postgres::NoTls;
+
+    struct MockEventProcessor;
+
+    #[async_trait::async_trait]
+    impl EventProcessor for MockEventProcessor {
+        fn delay_for_processing_post_exhaustion() -> Duration {
+            Duration::from_secs(1)
+        }
+
+        async fn process(event: Value) -> Result<(), Error> {
+            println!("Processing event: {:?}", event);
+            Ok(())
+        }
+
+        fn queue_id() -> i32 {
+            1
+        }
+
+        fn concurrent_processing_limit() -> i32 {
+            10
+        }
+
+        fn processing_timeout() -> chrono::Duration {
+            chrono::Duration::seconds(5)
+        }
+
+        fn max_retry_allowed() -> i32 {
+            3
+        }
+
+        fn get_retry_at(retry_count: i32) -> DateTime<Utc> {
+            Utc::now() + chrono::Duration::seconds(5 * (retry_count as i64))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_event_processor() {
+        let mut config = Config::new();
+        config.dbname = Some("postgres".to_string());
+        config.user = Some("postgres".to_string());
+        config.password = Some("password".to_string());
+        config.host = Some("localhost".to_string());
+        config.port = Some(5432);
+
+        // Use fast recycling which avoids full connection reset where safe.
+        config.manager = Some(ManagerConfig {
+            recycling_method: RecyclingMethod::Fast,
+        });
+
+        let pool = config.create_pool(Some(Runtime::Tokio1), NoTls).unwrap();
+        let handler = MockEventProcessor::start(pool);
+
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        handler.processing_handle.abort();
     }
 }

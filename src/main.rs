@@ -21,8 +21,8 @@ async fn main() {
 
     // Configure the Postgres pool. In production, prefer reading these from env vars.
     let mut config = Config::new();
-    config.dbname = Some("queue".to_string());
-    config.user = Some("vishal".to_string());
+    config.dbname = Some("postgres".to_string());
+    config.user = Some("postgres".to_string());
     config.password = Some("password".to_string());
     config.host = Some("localhost".to_string());
     config.port = Some(5432);
