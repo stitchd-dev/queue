@@ -38,6 +38,7 @@ drop routine if exists release_reservation;
 drop routine if exists add_destination;
 drop routine if exists create_dataset;
 drop routine if exists update_status;
+drop routine if exists cleanup_dataset;
 drop type if exists failed_job_update;
 drop type if exists job_status;
 
@@ -215,6 +216,38 @@ begin
     set reserved_slots = greatest(0, reserved_slots - actual_inserted)
     where id = queue_id
       and current_dataset = dataset_id;
+end;
+$$ language plpgsql;
+
+-- Cleanup all processed datasets for a queue
+create or replace function cleanup_dataset(queue_id int) returns void as
+$$
+declare
+    last_failed_dataset int;
+    table_record        record;
+begin
+    select last_failed_dataset into last_failed_dataset from queue where id = queue_id;
+    if last_failed_dataset > 0 then
+        if last_failed_dataset > 0 then
+            for table_record in (select tablename
+                                 from pg_tables
+                                 where schemaname = 'public'
+                                   and tablename ~ ('^queue_' || queue_id || '_job_[0-9]+$')
+                                   and substring(tablename from '_job_([0-9]+)$')::int < last_failed_dataset)
+                loop
+                    execute format('drop table if exists %I cascade', table_record.tablename);
+                end loop;
+
+            for table_record in (select tablename
+                                 from pg_tables
+                                 where schemaname = 'public'
+                                   and tablename ~ ('^queue_' || queue_id || '_data_[0-9]+$')
+                                   and substring(tablename from '_data_([0-9]+)$')::int < last_failed_dataset)
+                loop
+                    execute format('drop table if exists %I cascade', table_record.tablename);
+                end loop;
+        end if;
+    end if;
 end;
 $$ language plpgsql;
 

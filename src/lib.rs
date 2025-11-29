@@ -181,7 +181,13 @@ pub trait EventProcessor: Send + Sync {
 
     /// Cleans up old processed datasets.
     async fn cleanup_processed_datasets(pool: &Pool) {
-        // TODO
+        let conn = pool.get().await.unwrap();
+
+        let queue_id = Self::queue_id();
+
+        conn.query("SELECT cleanup_dataset($1)", &[&queue_id])
+            .await
+            .unwrap();
     }
 
     /// Compacts failed datasets to optimize storage.
