@@ -82,6 +82,8 @@ pub struct Queue {
     max_buffer_size: usize,
     /// Max Insertion Allowed Size
     max_insertion_allowed_size: usize,
+    /// Max Events Allowed per dataset
+    max_events_per_dataset: i32,
 }
 
 impl Queue {
@@ -104,9 +106,19 @@ impl Queue {
         max_duration: Option<Duration>,
         max_size: Option<usize>,
         max_insertion_allowed_size: Option<usize>,
+        max_events_per_dataset: Option<u16>,
     ) -> Self {
         let max_buffer_size = max_size.map(|s| s).unwrap_or(128);
-
+        let max_events_per_dataset = match max_events_per_dataset {
+            Some(d) => {
+                if d == 0 {
+                    i32::MAX
+                } else {
+                    d as i32
+                }
+            }
+            None => i32::MAX,
+        };
         Queue {
             id,
             data: Default::default(),
@@ -115,6 +127,7 @@ impl Queue {
             pool: pool.clone(),
             max_buffer_size,
             max_insertion_allowed_size: max_insertion_allowed_size.unwrap_or(128 * 2),
+            max_events_per_dataset,
         }
     }
 
@@ -228,10 +241,18 @@ impl Queue {
         // Get the current dataset
         let dataset_id: i32 = tx
             .query_one(
-                "SELECT get_current_dataset($1, $2)",
-                &[&(self.id), &(data.len() as i32)],
+                "SELECT get_current_dataset($1, $2, $3)",
+                &[
+                    &(self.id),
+                    &(data.len() as i32),
+                    &(self.max_events_per_dataset),
+                ],
             )
-            .await?
+            .await
+            .map_err(|err| {
+                println!("{}", err);
+                err
+            })?
             .get(0);
 
         let data_table_name = format!("queue_{}_data_{}", self.id, dataset_id);

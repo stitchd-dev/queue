@@ -34,57 +34,83 @@ async fn main() {
 
     let pool = config.create_pool(Some(Runtime::Tokio1), NoTls).unwrap();
 
-    let queue = Queue::get_queue(1, pool, Some(core::time::Duration::from_secs(2)), Some(4), None);
+    let queue = Queue::get_queue(
+        1,
+        pool,
+        Some(core::time::Duration::from_secs(2)),
+        Some(4),
+        None,
+        Some(5),
+    );
 
     let queue = Arc::new(queue);
-    queue.insert_data(vec![json!({
-        "a":1
-    }),
-                           json!({
-        "a":2
-    }),
-                           json!({
-        "a":3
-    }),
-                           json!({
-        "a":4
-    })
-    ]).await.expect("TODO: panic message");
+    queue
+        .insert_data(vec![
+            json!({
+                "a":1
+            }),
+            json!({
+                "a":2
+            }),
+            json!({
+                "a":3
+            }),
+            json!({
+                "a":4
+            }),
+        ])
+        .await
+        .expect("TODO: panic message");
 
-    queue.insert_data(vec![json!({
-        "a":5
-    }),
-                           json!({
-        "a":6
-    })
-    ]).await.expect("TODO: panic message");
+    queue
+        .insert_data(vec![
+            json!({
+                "a":5
+            }),
+            json!({
+                "a":6
+            }),
+        ])
+        .await
+        .expect("TODO: panic message");
 
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
+    queue
+        .insert_data(vec![
+            json!({
+                "a":7
+            }),
+            json!({
+                "a":8
+            }),
+        ])
+        .await
+        .expect("TODO: panic message");
 
-    queue.insert_data(vec![json!({
-        "a":7
-    }),
-                          json!({
-        "a":8
-    })
-    ]).await.expect("TODO: panic message");
+    queue
+        .insert_data(vec![
+            json!({
+                "a":9
+            }),
+            json!({
+                "a":10
+            }),
+        ])
+        .await
+        .expect("TODO: panic message");
 
-    queue.insert_data(vec![json!({
-        "a":9
-    }),
-                           json!({
-        "a":10
-    })
-    ]).await.expect("TODO: panic message");
-
-    queue.insert_data(vec![json!({
-        "a":11
-    }),
-                           json!({
-        "a":12
-    })
-    ]).await.expect("TODO: panic message");
+    queue
+        .insert_data(vec![
+            json!({
+                "a":11
+            }),
+            json!({
+                "a":12
+            }),
+        ])
+        .await
+        .expect("TODO: panic message");
 
     tokio::time::sleep(std::time::Duration::from_secs(20)).await;
 }
