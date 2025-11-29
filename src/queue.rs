@@ -104,14 +104,26 @@ impl Queue {
         id: i32,
         pool: deadpool_postgres::Pool,
         max_duration: Option<Duration>,
-        max_size: Option<usize>,
-        max_insertion_allowed_size: Option<usize>,
-        max_events_per_dataset: Option<u16>,
+        max_buffer_size: Option<u8>,
+        max_events_per_dataset: Option<u32>,
     ) -> Self {
-        let max_buffer_size = max_size.map(|s| s).unwrap_or(128);
+        let max_buffer_size = match max_buffer_size {
+            None => u8::MAX / 2,
+            Some(v) => {
+                if v == 0 {
+                    u8::MAX / 2
+                } else {
+                    v
+                }
+            }
+        } as usize;
         let max_events_per_dataset = match max_events_per_dataset {
             Some(d) => {
                 if d == 0 {
+                    i32::MAX
+                } else if d > i32::MAX as u32 {
+                    error!("Limiting to i32::MAX");
+
                     i32::MAX
                 } else {
                     d as i32
@@ -126,7 +138,7 @@ impl Queue {
             sync_handle: Default::default(),
             pool: pool.clone(),
             max_buffer_size,
-            max_insertion_allowed_size: max_insertion_allowed_size.unwrap_or(128 * 2),
+            max_insertion_allowed_size: max_buffer_size * 2,
             max_events_per_dataset,
         }
     }
@@ -167,10 +179,10 @@ impl Queue {
             lock.len()
         };
 
-        if length >= self.max_buffer_size {
-            if let Err(err) = self.sync_data().await {
-                error!("Error during auto-sync: {}", err);
-            }
+        if length >= self.max_buffer_size
+            && let Err(err) = self.sync_data().await
+        {
+            error!("Error during auto-sync: {}", err);
         }
 
         Ok(())
@@ -180,7 +192,7 @@ impl Queue {
     async fn cancel_auto_sync(&self) {
         let mut sync_handle = self.sync_handle.lock().await;
         if let Some(handle) = sync_handle.take() {
-            let _ = handle.abort();
+            handle.abort();
         }
     }
 
@@ -313,7 +325,7 @@ impl Queue {
         // Release the reservation with an actual inserted count
         tx.execute(
             "SELECT release_reservation($1, $2, $3)",
-            &[&(self.id as i32), &dataset_id, &(data.len() as i32)],
+            &[&self.id, &dataset_id, &(data.len() as i32)],
         )
         .await?;
 

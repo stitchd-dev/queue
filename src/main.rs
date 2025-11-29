@@ -39,7 +39,6 @@ async fn main() {
         pool,
         Some(core::time::Duration::from_secs(2)),
         Some(4),
-        None,
         Some(5),
     );
 
