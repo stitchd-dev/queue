@@ -11,6 +11,8 @@ pub enum InsertionError {
 
     /// Attempted to insert empty data collection.
     EmptyData,
+    /// Queue not Found
+    QueueNotFound(i32)
 }
 
 impl Error for InsertionError {

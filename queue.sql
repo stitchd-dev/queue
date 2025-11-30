@@ -61,7 +61,8 @@ create table queue
         constraint queue_processing_dataset_check check ( processing_dataset >= 0 and processing_dataset <= current_dataset ),
     -- Last dataset with failed jobs
     last_failed_dataset int         not null default 0
-        constraint queue_last_failed_dataset_check check ( last_failed_dataset >= 0 and last_failed_dataset <= processing_dataset )
+        constraint queue_last_failed_dataset_check check ( last_failed_dataset >= 0 and last_failed_dataset <= processing_dataset ),
+    active              bool        not null default true
 );
 
 -- Job status enum: pending, processing, failed, done, failed_permanently
