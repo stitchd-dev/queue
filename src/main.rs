@@ -11,13 +11,11 @@ pub mod queue;
 use crate::error::InsertionError;
 use crate::queue::Queue;
 use deadpool::Runtime;
-use deadpool::managed::PoolConfig;
 use deadpool_postgres::tokio_postgres::NoTls;
 use deadpool_postgres::{Config, ManagerConfig, Pool, PoolError, RecyclingMethod};
 use derive_more::{Display, Error, From};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -61,6 +59,8 @@ impl AppState {
             queues,
             _refresh_handle: tokio::spawn(async move {
                 loop {
+                    tokio::time::sleep(queue_refresh_delay).await;
+
                     let queues = queues_clone.clone();
                     Self::refresh_queues(
                         &pool,
@@ -70,8 +70,6 @@ impl AppState {
                         max_events_per_dataset_clone,
                     )
                     .await;
-
-                    tokio::time::sleep(queue_refresh_delay).await;
                 }
             }),
         };
@@ -168,24 +166,31 @@ async fn main() {
 
     let pool = config.create_pool(Some(Runtime::Tokio1), NoTls).unwrap();
 
-    let state = AppState::start(
+    let state = create_app_state(pool.clone()).await;
+
+    ingest_data(state).await;
+}
+
+async fn create_app_state(pool: Pool) -> AppState {
+    AppState::start(
         pool,
-        Duration::from_secs(30),
+        Duration::from_secs(120),
         128,
         Duration::from_secs(2),
-        50000,
+        100000,
     )
     .await
     .map_err(|e| {
         tracing::error!("Failed to initialize state: {}", e);
         e
     })
-    .unwrap();
+    .unwrap()
+}
 
+async fn ingest_data(state: AppState) {
     let time = tokio::time::Instant::now();
-    for i in 0..10000 {
-        println!("Lap {i}");
-        let data = (0..60)
+    for i in 0..40000 {
+        let data = (0..70)
             .map(|v| {
                 serde_json::json!({
                     "a": i,
@@ -200,6 +205,4 @@ async fn main() {
     let elapsed = time.elapsed().as_millis();
 
     println!("Elapsed Time {elapsed} ms");
-
-    tokio::time::sleep(Duration::from_secs(3)).await;
 }

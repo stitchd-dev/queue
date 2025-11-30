@@ -224,17 +224,17 @@ $$ language plpgsql;
 create or replace function cleanup_dataset(queue_id int) returns void as
 $$
 declare
-    last_failed_dataset int;
-    table_record        record;
+    failed_dataset int;
+    table_record   record;
 begin
-    select last_failed_dataset into last_failed_dataset from queue where id = queue_id;
-    if last_failed_dataset > 0 then
-        if last_failed_dataset > 0 then
+    select last_failed_dataset into failed_dataset from queue where id = queue_id;
+    if failed_dataset > 0 then
+        if failed_dataset > 0 then
             for table_record in (select tablename
                                  from pg_tables
                                  where schemaname = 'public'
                                    and tablename ~ ('^queue_' || queue_id || '_job_[0-9]+$')
-                                   and substring(tablename from '_job_([0-9]+)$')::int < last_failed_dataset)
+                                   and substring(tablename from '_job_([0-9]+)$')::int < failed_dataset)
                 loop
                     execute format('drop table if exists %I cascade', table_record.tablename);
                 end loop;
@@ -243,7 +243,7 @@ begin
                                  from pg_tables
                                  where schemaname = 'public'
                                    and tablename ~ ('^queue_' || queue_id || '_data_[0-9]+$')
-                                   and substring(tablename from '_data_([0-9]+)$')::int < last_failed_dataset)
+                                   and substring(tablename from '_data_([0-9]+)$')::int < failed_dataset)
                 loop
                     execute format('drop table if exists %I cascade', table_record.tablename);
                 end loop;

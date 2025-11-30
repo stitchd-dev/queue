@@ -81,7 +81,7 @@ pub struct EventProcessHandler {
 
 struct ProcessError {
     retry_count: i32,
-    error: Error,
+    _error: Error,
 }
 
 pub struct Job {
@@ -305,7 +305,7 @@ pub trait EventProcessor: Send + Sync {
                         .await
                         .map_err(|error| ProcessError {
                             retry_count: job.retry_count,
-                            error,
+                            _error: error,
                         }),
                 )
             }
@@ -401,7 +401,7 @@ async fn get_next_failed_dataset(
         .query(
             &format!(
                 "SELECT EXISTS (
-                            SELECT 1 {}
+                            SELECT 1 FROM {}
                             WHERE status IN ('processing', 'failed')
                             )",
                 job_table_name
@@ -414,7 +414,7 @@ async fn get_next_failed_dataset(
     if res.pop()?.get(0) {
         None
     } else {
-        let mut res = conn.query("UPDATE queue SET last_failed_dataset=last_failed_dataset+1 WHERE id = $1 AND last_failed_dataset = $2 AND last_failed_dataset < current_dataset RETURNING last_failed_dataset", &[&queue_id, &last_failed_dataset]).await.unwrap();
+        let mut res = conn.query("UPDATE queue SET last_failed_dataset=last_failed_dataset+1 WHERE id = $1 AND last_failed_dataset = $2 AND last_failed_dataset < processing_dataset RETURNING last_failed_dataset", &[&queue_id, &last_failed_dataset]).await.unwrap();
 
         let new_last_failed_dataset: i32 = if res.is_empty() {
             get_last_failed_dataset(&conn, &queue_id).await
@@ -557,17 +557,16 @@ mod tests {
             Duration::from_secs(1)
         }
         fn delay_for_dataset_compaction_process() -> Duration {
-            Duration::from_secs(1)
+            Duration::from_secs(100000)
         }
         fn delay_for_failed_events_processing() -> Duration {
-            Duration::from_secs(1)
+            Duration::from_secs(5)
         }
         fn delay_for_dataset_cleanup() -> Duration {
-            Duration::from_secs(1)
+            Duration::from_secs(20)
         }
 
         async fn process(event: Value) -> Result<(), Error> {
-            debug!("Processing event: {:?}", event);
             Ok(())
         }
 
@@ -576,7 +575,7 @@ mod tests {
         }
 
         fn concurrent_processing_limit() -> i64 {
-            2
+            256
         }
 
         fn processing_timeout() -> Duration {
@@ -609,6 +608,6 @@ mod tests {
         let pool = config.create_pool(Some(Runtime::Tokio1), NoTls).unwrap();
         let handler = MockEventProcessor::start(pool);
 
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(600)).await;
     }
 }
