@@ -62,6 +62,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, error};
+use tokio_postgres::{binary_copy::BinaryCopyInWriter, types::Type};
 use uuid::Uuid;
 
 /// Batching queue that buffers JSON payloads in-memory and flushes to PostgreSQL.
@@ -278,11 +279,11 @@ impl Queue {
             ))
             .await?;
 
-        let data_writer = tokio_postgres::binary_copy::BinaryCopyInWriter::new(
+        let data_writer = BinaryCopyInWriter::new(
             data_sink,
             &[
-                tokio_postgres::types::Type::UUID,
-                tokio_postgres::types::Type::JSONB,
+                Type::UUID,
+                Type::JSONB,
             ],
         );
 
@@ -308,9 +309,9 @@ impl Queue {
             ))
             .await?;
 
-        let job_writer = tokio_postgres::binary_copy::BinaryCopyInWriter::new(
+        let job_writer = BinaryCopyInWriter::new(
             job_sink,
-            &[tokio_postgres::types::Type::UUID],
+            &[Type::UUID],
         );
 
         futures::pin_mut!(job_writer);

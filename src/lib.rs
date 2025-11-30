@@ -2,7 +2,7 @@
 
 use bytes::BufMut;
 use chrono::{DateTime, Utc};
-use deadpool_postgres::{Manager, Object, Pool};
+use deadpool_postgres::{Object, Pool};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Duration;
