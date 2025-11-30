@@ -79,20 +79,14 @@ pub struct EventProcessHandler {
     pub failed_dataset_compaction: JoinHandle<()>,
 }
 
-async fn get_processing_dataset(conn: &Object, queue_id: &i32) -> i32 {
-    let row = conn
-        .query_one(
-            "SELECT processing_dataset FROM queue WHERE id = $1",
-            &[queue_id],
-        )
-        .await
-        .unwrap();
-    row.get(0)
-}
-
 struct ProcessError {
     retry_count: i32,
     error: Error,
+}
+
+pub struct Job {
+    data_uuid: Uuid,
+    retry_count: i32,
 }
 
 /// Trait for implementing event processors that consume jobs from PostgreSQL queues.
@@ -176,7 +170,58 @@ pub trait EventProcessor: Send + Sync {
 
     /// Processes events that have previously failed.
     async fn processing_failed_events(pool: &Pool) {
-        // TODO
+        let queue_id = Self::queue_id();
+        let mut conn = pool.get().await.unwrap();
+
+        let mut last_failed_dataset: i32 = get_last_failed_dataset(&conn, &queue_id).await;
+
+        loop {
+            debug!(
+                "Processing failed events for dataset {}",
+                last_failed_dataset
+            );
+            let data_table_name = format!("queue_{}_data_{}", &queue_id, last_failed_dataset);
+            let job_table_name = format!("queue_{}_job_{}", &queue_id, last_failed_dataset);
+
+            loop {
+                debug!("Processing Jobs");
+
+                let jobs = get_failed_jobs(
+                    &mut conn,
+                    &job_table_name,
+                    &Self::concurrent_processing_limit(),
+                    Self::processing_timeout(),
+                )
+                .await;
+
+                if jobs.is_empty() {
+                    break;
+                } else {
+                    Self::_process_jobs(
+                        &queue_id,
+                        &mut conn,
+                        last_failed_dataset,
+                        &data_table_name,
+                        &jobs,
+                    )
+                    .await;
+                }
+            }
+
+            debug!("Advancing Failed Dataset");
+
+            match get_next_failed_dataset(
+                &queue_id,
+                &mut conn,
+                last_failed_dataset,
+                &job_table_name,
+            )
+            .await
+            {
+                Some(new_dataset) => last_failed_dataset = new_dataset,
+                None => break,
+            }
+        }
     }
 
     /// Cleans up old processed datasets.
@@ -210,7 +255,7 @@ pub trait EventProcessor: Send + Sync {
             loop {
                 debug!("Processing Jobs");
 
-                let jobs = get_jobs(
+                let jobs = get_pending_jobs(
                     &mut conn,
                     &job_table_name,
                     &Self::concurrent_processing_limit(),
@@ -221,59 +266,14 @@ pub trait EventProcessor: Send + Sync {
                 if jobs.is_empty() {
                     break;
                 } else {
-                    let events = get_events(&mut conn, &data_table_name, &jobs).await;
-
-                    let results = futures::future::join_all(jobs.iter().map(|(job_id, job)| {
-                        let event_data = events.get(&job.data_uuid).cloned().unwrap();
-                        async move {
-                            (
-                                *job_id,
-                                Self::process(event_data)
-                                    .await
-                                    .map_err(|error| ProcessError {
-                                        retry_count: job.retry_count,
-                                        error,
-                                    }),
-                            )
-                        }
-                    }))
-                    .await;
-
-                    let mut done_jobs: Vec<i32> = Vec::new();
-                    let mut permanently_failed_jobs: Vec<i32> = Vec::new();
-                    let mut failed_jobs: Vec<FailedJobUpdate> = Vec::new();
-
-                    for (id, res) in results {
-                        match res {
-                            Ok(_) => done_jobs.push(id),
-                            Err(err) => {
-                                let retry_count = err.retry_count;
-
-                                if retry_count <= Self::max_retry_allowed() {
-                                    failed_jobs.push(FailedJobUpdate {
-                                        id,
-                                        try_at: Self::get_retry_at(retry_count),
-                                    });
-                                } else {
-                                    permanently_failed_jobs.push(id);
-                                }
-                            }
-                        }
-                    }
-
-                    // Batch update all job statuses using the SQL function
-                    conn.query(
-                        "SELECT update_status($1, $2, $3, $4, $5)",
-                        &[
-                            &queue_id,
-                            &processing_dataset,
-                            &done_jobs,
-                            &permanently_failed_jobs,
-                            &failed_jobs,
-                        ],
+                    Self::_process_jobs(
+                        &queue_id,
+                        &mut conn,
+                        processing_dataset,
+                        &data_table_name,
+                        &jobs,
                     )
-                    .await
-                    .unwrap();
+                    .await;
                 }
             }
 
@@ -286,6 +286,90 @@ pub trait EventProcessor: Send + Sync {
             }
         }
     }
+
+    async fn _process_jobs(
+        queue_id: &i32,
+        mut conn: &mut Object,
+        processing_dataset: i32,
+        data_table_name: &String,
+        jobs: &HashMap<i32, Job>,
+    ) {
+        let events = get_events(&mut conn, &data_table_name, &jobs).await;
+
+        let results = futures::future::join_all(jobs.iter().map(|(job_id, job)| {
+            let event_data = events.get(&job.data_uuid).cloned().unwrap();
+            async move {
+                (
+                    *job_id,
+                    Self::process(event_data)
+                        .await
+                        .map_err(|error| ProcessError {
+                            retry_count: job.retry_count,
+                            error,
+                        }),
+                )
+            }
+        }))
+        .await;
+
+        let mut done_jobs: Vec<i32> = Vec::new();
+        let mut permanently_failed_jobs: Vec<i32> = Vec::new();
+        let mut failed_jobs: Vec<FailedJobUpdate> = Vec::new();
+
+        for (id, res) in results {
+            match res {
+                Ok(_) => done_jobs.push(id),
+                Err(err) => {
+                    let retry_count = err.retry_count;
+
+                    if retry_count <= Self::max_retry_allowed() {
+                        failed_jobs.push(FailedJobUpdate {
+                            id,
+                            try_at: Self::get_retry_at(retry_count),
+                        });
+                    } else {
+                        permanently_failed_jobs.push(id);
+                    }
+                }
+            }
+        }
+
+        // Batch update all job statuses using the SQL function
+        conn.query(
+            "SELECT update_status($1, $2, $3, $4, $5)",
+            &[
+                &queue_id,
+                &processing_dataset,
+                &done_jobs,
+                &permanently_failed_jobs,
+                &failed_jobs,
+            ],
+        )
+        .await
+        .unwrap();
+    }
+}
+
+async fn get_processing_dataset(conn: &Object, queue_id: &i32) -> i32 {
+    let row = conn
+        .query_one(
+            "SELECT processing_dataset FROM queue WHERE id = $1",
+            &[queue_id],
+        )
+        .await
+        .unwrap();
+    row.get(0)
+}
+
+async fn get_last_failed_dataset(conn: &Object, queue_id: &i32) -> i32 {
+    let row = conn
+        .query_one(
+            "SELECT last_failed_dataset FROM queue WHERE id = $1",
+            &[queue_id],
+        )
+        .await
+        .unwrap();
+    row.get(0)
 }
 
 async fn get_next_processing_dataset(
@@ -307,9 +391,42 @@ async fn get_next_processing_dataset(
     }
 }
 
-struct Job {
-    data_uuid: Uuid,
-    retry_count: i32,
+async fn get_next_failed_dataset(
+    queue_id: &i32,
+    conn: &mut Object,
+    last_failed_dataset: i32,
+    job_table_name: &str,
+) -> Option<i32> {
+    let mut res = conn
+        .query(
+            &format!(
+                "SELECT EXISTS (
+                            SELECT 1 {}
+                            WHERE status IN ('processing', 'failed')
+                            )",
+                job_table_name
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+
+    if res.pop()?.get(0) {
+        None
+    } else {
+        let mut res = conn.query("UPDATE queue SET last_failed_dataset=last_failed_dataset+1 WHERE id = $1 AND last_failed_dataset = $2 AND last_failed_dataset < current_dataset RETURNING last_failed_dataset", &[&queue_id, &last_failed_dataset]).await.unwrap();
+
+        let new_last_failed_dataset: i32 = if res.is_empty() {
+            get_last_failed_dataset(&conn, &queue_id).await
+        } else {
+            res.pop().unwrap().get(0)
+        };
+
+        match new_last_failed_dataset == last_failed_dataset {
+            true => None,
+            false => Some(new_last_failed_dataset),
+        }
+    }
 }
 
 async fn get_events(
@@ -339,7 +456,50 @@ async fn get_events(
     events
 }
 
-async fn get_jobs(
+async fn get_failed_jobs(
+    conn: &mut Object,
+    job_table_name: &String,
+    concurrent_processing_limit: &i64,
+    processing_timeout: Duration,
+) -> HashMap<i32, Job> {
+    conn.query(
+        &format!(
+            "UPDATE {} SET
+                    status = 'processing',
+                    retry_count = retry_count + 1,
+                    try_at = $1,
+                    updated_at = now()
+                 WHERE id IN (
+                    SELECT id FROM {}
+                    WHERE (status = 'failed' OR status = 'processing') AND try_at < now()
+                    ORDER BY id
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT $2
+                 )
+                 RETURNING id, data, retry_count",
+            job_table_name, job_table_name
+        ),
+        &[
+            &(Utc::now() + processing_timeout),
+            concurrent_processing_limit,
+        ],
+    )
+    .await
+    .unwrap()
+    .iter()
+    .map(|row| {
+        (
+            row.get(0),
+            Job {
+                data_uuid: row.get(1),
+                retry_count: row.get(2),
+            },
+        )
+    })
+    .collect::<HashMap<i32, Job>>()
+}
+
+async fn get_pending_jobs(
     conn: &mut Object,
     job_table_name: &String,
     concurrent_processing_limit: &i64,
