@@ -40,7 +40,7 @@ impl AppState {
         max_buffer_size: u8,
         max_buffer_duration: Duration,
         max_events_per_dataset: u32,
-    ) -> Result<Self, AppStateError> {
+    ) -> Result<Arc<Self>, AppStateError> {
         let queues = Arc::new(RwLock::new(HashMap::new()));
         Self::refresh_queues(
             &pool,
@@ -76,7 +76,7 @@ impl AppState {
             }),
         };
 
-        Ok(state)
+        Ok(Arc::new(state))
     }
 
     pub async fn insert_data(&self, queue_id: i32, data: Vec<Value>) -> Result<(), InsertionError> {
@@ -173,7 +173,7 @@ async fn main() {
 
     let pool = config.create_pool(Some(Runtime::Tokio1), NoTls).unwrap();
 
-    let state = Arc::new(create_app_state(pool.clone()).await);
+    let state = create_app_state(pool.clone()).await;
 
     let listener = TcpListener::bind("127.0.0.1:9092").await.unwrap();
 
@@ -181,7 +181,7 @@ async fn main() {
 
     tokio::spawn(async move {
         while let Some(command) = worker_rx.recv().await {
-            state.clone().insert_data(1, command.message).await.unwrap();
+            state.insert_data(1, command.message).await.unwrap();
 
             command.tx.send("Ok".to_string()).unwrap();
         }
@@ -215,7 +215,7 @@ async fn main() {
     }
 }
 
-async fn create_app_state(pool: Pool) -> AppState {
+async fn create_app_state(pool: Pool) -> Arc<AppState> {
     AppState::start(
         pool,
         Duration::from_secs(120),
@@ -229,24 +229,4 @@ async fn create_app_state(pool: Pool) -> AppState {
         e
     })
     .unwrap()
-}
-
-async fn ingest_data(state: AppState) {
-    let time = tokio::time::Instant::now();
-    for i in 0..40000 {
-        let data = (0..70)
-            .map(|v| {
-                serde_json::json!({
-                    "a": i,
-                    "b": v
-                })
-            })
-            .collect::<Vec<_>>();
-
-        state.insert_data(1, data).await.unwrap();
-    }
-
-    let elapsed = time.elapsed().as_millis();
-
-    println!("Elapsed Time {elapsed} ms");
 }
