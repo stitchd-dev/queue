@@ -18,7 +18,9 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
+use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 #[derive(From, Error, Debug, Display)]
@@ -147,6 +149,11 @@ impl AppState {
     }
 }
 
+struct Command {
+    message: Vec<Value>,
+    tx: oneshot::Sender<String>,
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
@@ -166,9 +173,46 @@ async fn main() {
 
     let pool = config.create_pool(Some(Runtime::Tokio1), NoTls).unwrap();
 
-    let state = create_app_state(pool.clone()).await;
+    let state = Arc::new(create_app_state(pool.clone()).await);
 
-    ingest_data(state).await;
+    let listener = TcpListener::bind("127.0.0.1:9092").await.unwrap();
+
+    let (server_tx, mut worker_rx) = mpsc::channel::<Command>(100);
+
+    tokio::spawn(async move {
+        while let Some(command) = worker_rx.recv().await {
+            state.clone().insert_data(1, command.message).await.unwrap();
+
+            command.tx.send("Ok".to_string()).unwrap();
+        }
+    });
+
+    loop {
+        let (socker, _addr) = listener.accept().await.unwrap();
+        let server_tx = server_tx.clone();
+        tokio::spawn(async move {
+            let (reader, mut writer) = socker.into_split();
+
+            let mut buf = String::new();
+
+            let mut reader = BufReader::new(reader);
+
+            while let Ok(_bytes_read) = reader.read_line(&mut buf).await {
+                let message = serde_json::from_str::<Vec<Value>>(&buf).unwrap();
+
+                let (tx, rx) = oneshot::channel();
+
+                let cmd = Command { message, tx };
+
+                server_tx.send(cmd).await.unwrap();
+
+                let res = rx.await.unwrap();
+                writer.write_all(res.as_bytes()).await.unwrap();
+
+                buf.clear();
+            }
+        });
+    }
 }
 
 async fn create_app_state(pool: Pool) -> AppState {
