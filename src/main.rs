@@ -5,154 +5,23 @@
 //! would normally create or obtain a `Queue` from the `queue` module and use
 //! it to buffer and flush events.
 
+mod command;
+mod connection;
+mod constant;
 mod error;
 pub mod queue;
+mod state;
 
-use crate::error::InsertionError;
-use crate::queue::Queue;
+use crate::command::Command;
+use crate::connection::listen;
+use crate::state::AppState;
 use deadpool::Runtime;
 use deadpool_postgres::tokio_postgres::NoTls;
-use deadpool_postgres::{Config, ManagerConfig, Pool, PoolError, RecyclingMethod};
-use derive_more::{Display, Error, From};
-use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
-use tokio::sync::{RwLock, mpsc, oneshot};
-use tokio::task::JoinHandle;
-
-#[derive(From, Error, Debug, Display)]
-pub enum AppStateError {
-    Pool(PoolError),
-}
-
-pub struct AppState {
-    queues: Arc<RwLock<HashMap<i32, Arc<Queue>>>>,
-    _refresh_handle: JoinHandle<()>,
-}
-
-impl AppState {
-    pub async fn start(
-        pool: Pool,
-        queue_refresh_delay: Duration,
-        max_buffer_size: u8,
-        max_buffer_duration: Duration,
-        max_events_per_dataset: u32,
-    ) -> Result<Arc<Self>, AppStateError> {
-        let queues = Arc::new(RwLock::new(HashMap::new()));
-        Self::refresh_queues(
-            &pool,
-            queues.clone(),
-            max_buffer_size,
-            max_buffer_duration,
-            max_events_per_dataset,
-        )
-        .await;
-
-        let queues_clone = queues.clone();
-
-        let max_buffer_size_clone = max_buffer_size.clone();
-        let max_buffer_duration_clone = max_buffer_duration.clone();
-        let max_events_per_dataset_clone = max_events_per_dataset.clone();
-
-        let state = Self {
-            queues,
-            _refresh_handle: tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(queue_refresh_delay).await;
-
-                    let queues = queues_clone.clone();
-                    Self::refresh_queues(
-                        &pool,
-                        queues,
-                        max_buffer_size_clone,
-                        max_buffer_duration_clone,
-                        max_events_per_dataset_clone,
-                    )
-                    .await;
-                }
-            }),
-        };
-
-        Ok(Arc::new(state))
-    }
-
-    pub async fn insert_data(&self, queue_id: i32, data: Vec<Value>) -> Result<(), InsertionError> {
-        let queue = self
-            .queues
-            .read()
-            .await
-            .get(&queue_id)
-            .cloned()
-            .ok_or(InsertionError::QueueNotFound(queue_id))?;
-
-        queue.insert_data(data).await
-    }
-
-    async fn refresh_queues(
-        pool_clone: &Pool,
-        queues_clone: Arc<RwLock<HashMap<i32, Arc<Queue>>>>,
-        max_buffer_size: u8,
-        max_buffer_duration: Duration,
-        max_events_per_dataset: u32,
-    ) {
-        let queues = Self::get_queues(&pool_clone).await.unwrap();
-
-        println!("Queues are {:?}", queues);
-
-        let current_queues = queues_clone
-            .read()
-            .await
-            .keys()
-            .cloned()
-            .collect::<HashSet<i32>>();
-
-        let to_be_removed: Vec<i32> = current_queues.difference(&queues).cloned().collect();
-        let to_be_added: Vec<i32> = queues.difference(&current_queues).cloned().collect();
-
-        if !(to_be_removed.is_empty() && to_be_added.is_empty()) {
-            let mut write = queues_clone.write().await;
-
-            for queue_id in to_be_removed {
-                write.remove(&queue_id);
-            }
-
-            for queue_id in to_be_added {
-                write.insert(
-                    queue_id,
-                    Arc::new(Queue::get_queue(
-                        queue_id,
-                        pool_clone.clone(),
-                        Some(max_buffer_duration),
-                        Some(max_buffer_size),
-                        Some(max_events_per_dataset),
-                    )),
-                );
-            }
-        }
-    }
-
-    async fn get_queues(pool: &Pool) -> Result<HashSet<i32>, AppStateError> {
-        let conn = pool.get().await?;
-
-        let queues = conn
-            .query("SELECT id FROM queue WHERE active = true", &[])
-            .await
-            .unwrap();
-
-        Ok(queues
-            .iter()
-            .map(|row| row.get(0))
-            .collect::<HashSet<i32>>())
-    }
-}
-
-struct Command {
-    message: Vec<Value>,
-    tx: oneshot::Sender<String>,
-}
+use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() {
@@ -177,42 +46,11 @@ async fn main() {
 
     let listener = TcpListener::bind("127.0.0.1:9092").await.unwrap();
 
-    let (server_tx, mut worker_rx) = mpsc::channel::<Command>(100);
+    let (server_tx, worker_rx) = mpsc::channel::<Command>(500);
 
-    tokio::spawn(async move {
-        while let Some(command) = worker_rx.recv().await {
-            state.insert_data(1, command.message).await.unwrap();
+    let _worker_handle = connection::process(worker_rx, state);
 
-            command.tx.send("Ok".to_string()).unwrap();
-        }
-    });
-
-    loop {
-        let (socker, _addr) = listener.accept().await.unwrap();
-        let server_tx = server_tx.clone();
-        tokio::spawn(async move {
-            let (reader, mut writer) = socker.into_split();
-
-            let mut buf = String::new();
-
-            let mut reader = BufReader::new(reader);
-
-            while let Ok(_bytes_read) = reader.read_line(&mut buf).await {
-                let message = serde_json::from_str::<Vec<Value>>(&buf).unwrap();
-
-                let (tx, rx) = oneshot::channel();
-
-                let cmd = Command { message, tx };
-
-                server_tx.send(cmd).await.unwrap();
-
-                let res = rx.await.unwrap();
-                writer.write_all(res.as_bytes()).await.unwrap();
-
-                buf.clear();
-            }
-        });
-    }
+    listen(listener, server_tx).await;
 }
 
 async fn create_app_state(pool: Pool) -> Arc<AppState> {
