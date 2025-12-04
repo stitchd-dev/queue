@@ -20,6 +20,10 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub async fn check_if_queue_exists(&self, queue_id: i32) -> bool {
+        self.queues.read().await.contains_key(&queue_id)
+    }
+
     pub async fn start(
         pool: Pool,
         queue_refresh_delay: Duration,

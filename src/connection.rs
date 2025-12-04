@@ -26,9 +26,10 @@ fn process_worker(mut worker_rx: mpsc::Receiver<Command>, state: Arc<AppState>) 
 pub(crate) async fn listen(listener: TcpListener, state: Arc<AppState>) -> () {
     let (server_tx, worker_rx) = mpsc::channel::<Command>(EVENT_PROCESSOR_MPSC_BUFFER_LIMIT);
 
-    let _worker_handle = process_worker(worker_rx, state);
+    let _worker_handle = process_worker(worker_rx, state.clone());
 
     loop {
+        let state = state.clone();
         let (mut socker, _addr) = listener.accept().await.unwrap();
 
         let conn_permit = match acquire_connection() {
@@ -60,7 +61,7 @@ pub(crate) async fn listen(listener: TcpListener, state: Arc<AppState>) -> () {
                     break;
                 }
 
-                let res = process_bytes(&server_tx, buf.as_ref()).await;
+                let res = process_bytes(&server_tx, buf.as_ref(), &state).await;
 
                 match res {
                     Ok(res) => send_response(&mut writer, res.as_bytes()).await,
@@ -74,53 +75,36 @@ pub(crate) async fn listen(listener: TcpListener, state: Arc<AppState>) -> () {
 }
 
 async fn send_error_response(mut writer: &mut OwnedWriteHalf, e: ProcessError) {
-    match e {
+    let message = match e {
         ProcessError::LimitsExceeded => {
-            send_response(
-                &mut writer,
-                b"Error: Too many in-flight requests under process. Please try again later.",
-            )
-            .await;
+            "Error: Too many in-flight requests under process. Please try again later.".to_string()
         }
         ProcessError::InvalidInput(e) => match e {
-            OperationError::OperationNotFound => {
-                send_response(&mut writer, b"Error: Operation not found.").await;
-            }
-            OperationError::EmptyPayload => {
-                send_response(&mut writer, b"Error: Empty Payload.").await;
-            }
+            OperationError::OperationNotFound => "Error: Operation not found.".to_string(),
+            OperationError::InvalidPayload => "Error: Empty Payload.".to_string(),
             OperationError::ChunkSizeExceeded(err) => {
-                send_response(
-                    &mut writer,
-                    format!("Error: Chunk size exceeded: {}", err).as_bytes(),
-                )
-                .await;
+                format!("Error: Chunk size exceeded: {}", err)
             }
             OperationError::DeserializationError(err) => {
-                send_response(
-                    &mut writer,
-                    format!("Error: Deserialization error: {}", err).as_bytes(),
-                )
-                .await;
+                format!("Error: Deserialization error: {}", err)
             }
+            OperationError::UTFError(err) => format!("Error: UTF error: {}", err),
+            OperationError::IntParse(err) => format!("Error: Int parse error: {}", err),
+            OperationError::QueueNotFound => "Error: Queue not found.".to_string(),
         },
         ProcessError::Send(err) => {
             tracing::error!("Failed to send command to worker: {}", err);
-            send_response(
-                &mut writer,
-                b"InternalError: Failed to send event to processor.",
-            )
-            .await;
+
+            "InternalError: Failed to send event to processor.".to_string()
         }
         ProcessError::Receiver(err) => {
             tracing::error!("Failed to receive command from worker: {}", err);
-            send_response(
-                &mut writer,
-                b"InternalError: Failed to receive event from processor.",
-            )
-            .await;
+
+            "InternalError: Failed to receive event from processor.".to_string()
         }
-    }
+    };
+
+    send_response(&mut writer, message.as_bytes()).await;
 }
 
 async fn send_response<T: AsyncWriteExt + Unpin>(writer: &mut T, bytes: &[u8]) -> () {
@@ -140,6 +124,7 @@ pub enum ProcessError {
 pub async fn process_bytes(
     sender: &mpsc::Sender<Command>,
     bytes: &[u8],
+    state: &AppState,
 ) -> Result<String, ProcessError> {
     let permit = match acquire_process() {
         Ok(permit) => permit,
@@ -148,7 +133,7 @@ pub async fn process_bytes(
         }
     };
 
-    let operation = Operation::read_bytes(bytes)?;
+    let operation = Operation::read_bytes(bytes, state).await?;
 
     let (tx, rx) = oneshot::channel();
 
