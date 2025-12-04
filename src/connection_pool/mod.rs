@@ -1,11 +1,19 @@
 mod guard;
 
 pub(crate) use crate::connection_pool::guard::ConnectionGuard;
-use crate::constant::{CONNECTION_LIMIT, allocate_bytes};
+use crate::constant::{CONNECTION_LIMIT, IN_FLIGHT_LIMIT, allocate_bytes};
 use bytes::BytesMut;
 use crossbeam::queue::SegQueue;
 use std::sync::OnceLock;
-use tokio::sync::{Semaphore, TryAcquireError};
+use tokio::sync::{Semaphore, SemaphorePermit, TryAcquireError};
+
+static PROCESS_POOL: OnceLock<Semaphore> = OnceLock::new();
+
+pub fn acquire_process() -> Result<SemaphorePermit<'static>, TryAcquireError> {
+    PROCESS_POOL
+        .get_or_init(|| Semaphore::new(IN_FLIGHT_LIMIT))
+        .try_acquire()
+}
 
 struct ConnectionPool {
     buffer_pool: SegQueue<BytesMut>,

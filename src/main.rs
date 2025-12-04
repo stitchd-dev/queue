@@ -13,7 +13,6 @@ mod error;
 pub mod queue;
 mod state;
 
-use crate::command::Command;
 use crate::connection::listen;
 use crate::state::AppState;
 use deadpool::Runtime;
@@ -22,7 +21,6 @@ use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() {
@@ -47,11 +45,7 @@ async fn main() {
 
     let listener = TcpListener::bind("127.0.0.1:9092").await.unwrap();
 
-    let (server_tx, worker_rx) = mpsc::channel::<Command>(500);
-
-    let _worker_handle = connection::process(worker_rx, state);
-
-    listen(listener, server_tx).await;
+    listen(listener, state).await;
 }
 
 async fn create_app_state(pool: Pool) -> Arc<AppState> {

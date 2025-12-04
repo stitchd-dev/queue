@@ -6,7 +6,7 @@ use tokio::sync::{SemaphorePermit, oneshot};
 #[derive(Debug, Display, From)]
 pub enum OperationError {
     OperationNotFound,
-    InvalidPayload,
+    EmptyPayload,
     ChunkSizeExceeded(usize),
     DeserializationError(DeSerializationError),
 }
@@ -35,7 +35,7 @@ impl Operation {
             let bytes = bytes.trim_ascii();
 
             if bytes.is_empty() {
-                Err(OperationError::InvalidPayload)
+                Err(OperationError::EmptyPayload)
             } else {
                 let mut result = Vec::new();
                 let mut stream = Deserializer::from_slice(bytes).into_iter::<Value>();

@@ -1,14 +1,17 @@
-use crate::command::{Command, Operation};
-use crate::connection_pool::acquire_connection;
-use crate::constant::{in_flight_limit, is_valid_message, read_data};
+use crate::command::{Command, Operation, OperationError};
+use crate::connection_pool::{acquire_connection, acquire_process};
+use crate::constant::{EVENT_PROCESSOR_MPSC_BUFFER_LIMIT, is_valid_message, read_data};
 use crate::state::AppState;
+use derive_more::{Display, From};
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
+use tokio::net::tcp::OwnedWriteHalf;
+use tokio::sync::mpsc::error::SendError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-pub fn process(mut worker_rx: mpsc::Receiver<Command>, state: Arc<AppState>) -> JoinHandle<()> {
+fn process_worker(mut worker_rx: mpsc::Receiver<Command>, state: Arc<AppState>) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(command) = worker_rx.recv().await {
             let state = state.clone();
@@ -20,18 +23,19 @@ pub fn process(mut worker_rx: mpsc::Receiver<Command>, state: Arc<AppState>) -> 
     })
 }
 
-pub async fn listen(listener: TcpListener, server_tx: mpsc::Sender<Command>) -> () {
+pub(crate) async fn listen(listener: TcpListener, state: Arc<AppState>) -> () {
+    let (server_tx, worker_rx) = mpsc::channel::<Command>(EVENT_PROCESSOR_MPSC_BUFFER_LIMIT);
+
+    let _worker_handle = process_worker(worker_rx, state);
+
     loop {
-        let (mut socker, addr) = listener.accept().await.unwrap();
+        let (mut socker, _addr) = listener.accept().await.unwrap();
 
         let conn_permit = match acquire_connection() {
             Ok(permit) => permit,
             Err(_) => {
                 tracing::warn!("Too many active connections.");
-                socker
-                    .write_all(b"Too many active connections. Please try again later.")
-                    .await
-                    .unwrap();
+                send_response(&mut socker, b"Error: Too many active connections.").await;
                 continue;
             }
         };
@@ -47,62 +51,114 @@ pub async fn listen(listener: TcpListener, server_tx: mpsc::Sender<Command>) -> 
 
             while let Ok(bytes_read) = read_data(&mut reader, buf).await {
                 if bytes_read == 0 {
-                    tracing::info!("Client {} disconnected", addr);
                     break;
                 }
 
                 if is_valid_message(bytes_read) {
-                    tracing::error!("Client {} sent too large message", addr);
-                    writer
-                        .write_all(b"Error: Message too large. Disconnecting...")
-                        .await
-                        .unwrap();
+                    send_response(&mut writer, b"Error: Message too large. Disconnecting...").await;
 
                     break;
                 }
 
-                let permit = match in_flight_limit().try_acquire() {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        writer
-                            .write_all(b"Error: Too many in-flight requests under process. Please try again later.")
-                            .await
-                            .unwrap();
-                        continue;
-                    }
-                };
+                let res = process_bytes(&server_tx, buf.as_ref()).await;
 
-                let message = Operation::read_bytes(buf);
-
-                let operation = match message {
-                    Ok(message) => message,
-                    Err(e) => {
-                        tracing::debug!("Error: {}", e);
-
-                        writer
-                            .write_all(format!("Error: {}", e).as_bytes())
-                            .await
-                            .unwrap();
-
-                        continue;
-                    }
-                };
-
-                let (tx, rx) = oneshot::channel();
-
-                let cmd = Command {
-                    operation,
-                    tx,
-                    _permit: permit,
-                };
-
-                server_tx.send(cmd).await.unwrap();
-
-                let res = rx.await.unwrap();
-                writer.write_all(res.as_bytes()).await.unwrap();
+                match res {
+                    Ok(res) => send_response(&mut writer, res.as_bytes()).await,
+                    Err(e) => send_error_response(&mut writer, e).await,
+                }
 
                 buf.clear();
             }
         });
     }
+}
+
+async fn send_error_response(mut writer: &mut OwnedWriteHalf, e: ProcessError) {
+    match e {
+        ProcessError::LimitsExceeded => {
+            send_response(
+                &mut writer,
+                b"Error: Too many in-flight requests under process. Please try again later.",
+            )
+            .await;
+        }
+        ProcessError::InvalidInput(e) => match e {
+            OperationError::OperationNotFound => {
+                send_response(&mut writer, b"Error: Operation not found.").await;
+            }
+            OperationError::EmptyPayload => {
+                send_response(&mut writer, b"Error: Empty Payload.").await;
+            }
+            OperationError::ChunkSizeExceeded(err) => {
+                send_response(
+                    &mut writer,
+                    format!("Error: Chunk size exceeded: {}", err).as_bytes(),
+                )
+                .await;
+            }
+            OperationError::DeserializationError(err) => {
+                send_response(
+                    &mut writer,
+                    format!("Error: Deserialization error: {}", err).as_bytes(),
+                )
+                .await;
+            }
+        },
+        ProcessError::Send(err) => {
+            tracing::error!("Failed to send command to worker: {}", err);
+            send_response(
+                &mut writer,
+                b"InternalError: Failed to send event to processor.",
+            )
+            .await;
+        }
+        ProcessError::Receiver(err) => {
+            tracing::error!("Failed to receive command from worker: {}", err);
+            send_response(
+                &mut writer,
+                b"InternalError: Failed to receive event from processor.",
+            )
+            .await;
+        }
+    }
+}
+
+async fn send_response<T: AsyncWriteExt + Unpin>(writer: &mut T, bytes: &[u8]) -> () {
+    if let Err(e) = writer.write_all(bytes).await {
+        tracing::error!("Failed to write to client: {}", e);
+    }
+}
+
+#[derive(Debug, Display, From)]
+pub enum ProcessError {
+    LimitsExceeded,
+    InvalidInput(OperationError),
+    Send(SendError<Command>),
+    Receiver(oneshot::error::RecvError),
+}
+
+pub async fn process_bytes(
+    sender: &mpsc::Sender<Command>,
+    bytes: &[u8],
+) -> Result<String, ProcessError> {
+    let permit = match acquire_process() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return Err(ProcessError::LimitsExceeded);
+        }
+    };
+
+    let operation = Operation::read_bytes(bytes)?;
+
+    let (tx, rx) = oneshot::channel();
+
+    let cmd = Command {
+        operation,
+        tx,
+        _permit: permit,
+    };
+
+    sender.send(cmd).await?;
+
+    Ok(rx.await?)
 }

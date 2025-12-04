@@ -1,13 +1,13 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::Duration;
+use crate::error::InsertionError;
+use crate::queue::Queue;
 use deadpool_postgres::{Pool, PoolError};
 use derive_more::{Display, Error, From};
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
-use crate::error::InsertionError;
-use crate::queue::Queue;
 
 #[derive(From, Error, Debug, Display)]
 pub enum AppStateError {
@@ -35,7 +35,7 @@ impl AppState {
             max_buffer_duration,
             max_events_per_dataset,
         )
-            .await;
+        .await;
 
         let queues_clone = queues.clone();
 
@@ -57,7 +57,7 @@ impl AppState {
                         max_buffer_duration_clone,
                         max_events_per_dataset_clone,
                     )
-                        .await;
+                    .await;
                 }
             }),
         };
