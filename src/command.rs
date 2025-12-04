@@ -1,7 +1,7 @@
+use crate::constant::{is_insert, is_ping, is_valid_chunk, min_len_check};
 use derive_more::{Display, From};
 use serde_json::{Deserializer, Value};
 use tokio::sync::{SemaphorePermit, oneshot};
-use crate::constant::{is_insert, is_ping, min_len_check, READ_CHUNK_SIZE};
 
 #[derive(Debug, Display, From)]
 pub enum OperationError {
@@ -24,14 +24,14 @@ pub enum Operation {
 }
 
 impl Operation {
-    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, OperationError> {
+    pub(crate) fn read_bytes(bytes: &[u8]) -> Result<Self, OperationError> {
         let bytes = bytes.trim_ascii();
         if min_len_check(bytes) {
             return Err(OperationError::OperationNotFound);
         }
         if is_ping(bytes) {
             Ok(Self::Ping)
-        } else if let Some(bytes) = is_insert(bytes){
+        } else if let Some(bytes) = is_insert(bytes) {
             let bytes = bytes.trim_ascii();
 
             if bytes.is_empty() {
@@ -55,14 +55,13 @@ impl Operation {
 
                     let size = current_offset - prev_offset;
 
-                    if size > READ_CHUNK_SIZE {
+                    if is_valid_chunk(size) {
+                        prev_offset = current_offset;
+                        result.push(value);
+                        index += 1;
+                    } else {
                         return Err(OperationError::ChunkSizeExceeded(index));
                     }
-
-                    prev_offset = current_offset;
-
-                    result.push(value);
-                    index += 1;
                 }
 
                 Ok(Self::Insert(result))

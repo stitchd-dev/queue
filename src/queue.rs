@@ -32,7 +32,7 @@
 //! use serde_json::json;
 //!
 //! # async fn example() -> anyhow::Result<()> {
-//! // Build a pool (normally from env/config)
+//! // Build a connection_pool (normally from env/config)
 //! let mut cfg = Config::new();
 //! cfg.dbname = Some("vishal".into());
 //! cfg.user = Some("vishal".into());
@@ -40,10 +40,10 @@
 //! cfg.host = Some("localhost".into());
 //! cfg.port = Some(5432);
 //! cfg.manager = Some(ManagerConfig { recycling_method: RecyclingMethod::Fast });
-//! let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls)?;
+//! let connection_pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls)?;
 //!
 //! // Obtain a queue by destination id (with default max_duration and max_size)
-//! let queue: Arc<Queue> = Queue::get_queue(42, pool.clone(), None, None).await.map_err(|_| anyhow::anyhow!("missing destination"))?;
+//! let queue: Arc<Queue> = Queue::get_queue(42, connection_pool.clone(), None, None).await.map_err(|_| anyhow::anyhow!("missing destination"))?;
 //!
 //! // Insert some payloads from source id 7
 //! queue.insert_data(json!({"event": "signup", "user_id": 1}), 7).await?;
@@ -77,7 +77,7 @@ pub struct Queue {
     max_duration: Duration,
     /// Handle to a scheduled background task that will run a timed sync.
     sync_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Connection pool used for database operations.
+    /// Connection connection_pool used for database operations.
     pool: deadpool_postgres::Pool,
     /// Number of buffered items that triggers an immediate sync when exceeded.
     max_buffer_size: usize,
@@ -88,14 +88,14 @@ pub struct Queue {
 }
 
 impl Queue {
-    /// Construct a queue handle for a given `destination_id` using the provided pool.
+    /// Construct a queue handle for a given `destination_id` using the provided connection_pool.
     ///
     /// Looks up the queue row and initializes the in-memory buffer. Returns an
     /// `Arc<Queue>` so the same queue can be shared across tasks.
     ///
     /// Parameters:
     /// - `destination_id`: The queue destination identifier.
-    /// - `pool`: Database connection pool.
+    /// - `connection_pool`: Database connection connection_pool.
     /// - `max_duration`: Maximum time to wait before auto-flushing (default: 10 seconds).
     /// - `max_size`: Maximum number of items before triggering a sync (default: 128).
     ///

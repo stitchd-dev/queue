@@ -1,12 +1,13 @@
 //! Binary entrypoint used for quick local connectivity checks.
 //!
-//! This example sets up a Deadpool Postgres connection pool and performs a
+//! This example sets up a Deadpool Postgres connection connection_pool and performs a
 //! simple `SELECT 1 + $1` query to verify database access. Application code
 //! would normally create or obtain a `Queue` from the `queue` module and use
 //! it to buffer and flush events.
 
 mod command;
 mod connection;
+pub(crate) mod connection_pool;
 mod constant;
 mod error;
 pub mod queue;
@@ -27,7 +28,7 @@ use tokio::sync::mpsc;
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    // Configure the Postgres pool. In production, prefer reading these from env vars.
+    // Configure the Postgres connection_pool. In production, prefer reading these from env vars.
     let mut config = Config::new();
     config.dbname = Some("postgres".to_string());
     config.user = Some("postgres".to_string());

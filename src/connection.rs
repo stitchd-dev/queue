@@ -1,9 +1,9 @@
 use crate::command::{Command, Operation};
-use crate::constant::{MAX_MESSAGE_SIZE, READ_CHUNK_SIZE, connection_limit, inflight_limit};
+use crate::connection_pool::acquire_connection;
+use crate::constant::{in_flight_limit, is_valid_message, read_data};
 use crate::state::AppState;
-use bytes::BytesMut;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -24,7 +24,7 @@ pub async fn listen(listener: TcpListener, server_tx: mpsc::Sender<Command>) -> 
     loop {
         let (mut socker, addr) = listener.accept().await.unwrap();
 
-        let _conn_permit = match connection_limit().try_acquire() {
+        let conn_permit = match acquire_connection() {
             Ok(permit) => permit,
             Err(_) => {
                 tracing::warn!("Too many active connections.");
@@ -38,40 +38,41 @@ pub async fn listen(listener: TcpListener, server_tx: mpsc::Sender<Command>) -> 
 
         let server_tx = server_tx.clone();
         tokio::spawn(async move {
-            let (reader, mut writer) = socker.into_split();
+            let mut conn_permit = conn_permit;
+            let buf = conn_permit.bytes();
 
-            let mut buf = BytesMut::with_capacity(READ_CHUNK_SIZE);
+            let (reader, mut writer) = socker.into_split();
 
             let mut reader = BufReader::new(reader);
 
-            while let Ok(bytes_read) = (&mut reader)
-                .take(MAX_MESSAGE_SIZE)
-                .read(&mut buf)
-                .await
-                .map(|x| x as u64)
-            {
+            while let Ok(bytes_read) = read_data(&mut reader, buf).await {
                 if bytes_read == 0 {
                     tracing::info!("Client {} disconnected", addr);
                     break;
                 }
 
-                if bytes_read == MAX_MESSAGE_SIZE {
+                if is_valid_message(bytes_read) {
                     tracing::error!("Client {} sent too large message", addr);
+                    writer
+                        .write_all(b"Error: Message too large. Disconnecting...")
+                        .await
+                        .unwrap();
+
                     break;
                 }
 
-                let permit = match inflight_limit().try_acquire() {
+                let permit = match in_flight_limit().try_acquire() {
                     Ok(permit) => permit,
                     Err(_) => {
                         writer
-                            .write_all(b"Error: Too many in-flight requests")
+                            .write_all(b"Error: Too many in-flight requests under process. Please try again later.")
                             .await
                             .unwrap();
                         continue;
                     }
                 };
 
-                let message = Operation::from_bytes(&buf);
+                let message = Operation::read_bytes(buf);
 
                 let operation = match message {
                     Ok(message) => message,

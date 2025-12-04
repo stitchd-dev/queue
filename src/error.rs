@@ -26,7 +26,7 @@ impl Error for InsertionError {
 /// Error type for synchronization (flush) operations.
 #[derive(From, Debug, Display, Error)]
 pub enum SyncError {
-    /// Connection pool error.
+    /// Connection connection_pool error.
     Pool(PoolError),
 
     /// PostgreSQL database error.
