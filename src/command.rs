@@ -32,7 +32,7 @@ pub enum Operation {
 impl Operation {
     pub(crate) async fn read_bytes(bytes: &[u8], state: &AppState) -> Result<Self, OperationError> {
         let bytes = bytes.trim_ascii();
-        if min_len_check(bytes) {
+        if !min_len_check(bytes) {
             return Err(OperationError::OperationNotFound);
         }
         if is_ping(bytes) {
@@ -105,7 +105,7 @@ pub struct Command {
 }
 
 impl Command {
-    pub async fn process(self, state: &crate::AppState) {
+    pub async fn process(self, state: &AppState) {
         match self.operation {
             Operation::Ping => {
                 tracing::debug!("Client pinged");

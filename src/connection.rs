@@ -61,7 +61,7 @@ pub(crate) async fn listen(listener: TcpListener, state: Arc<AppState>) -> () {
                     break;
                 }
 
-                if is_valid_message(bytes_read) {
+                if !is_valid_message(bytes_read) {
                     send_response(&mut writer, b"Error: Message too large. Disconnecting...").await;
 
                     break;
