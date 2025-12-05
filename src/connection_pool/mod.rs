@@ -44,7 +44,12 @@ fn get_pool() -> &'static ConnectionPool {
 pub fn acquire_connection() -> Result<ConnectionGuard, TryAcquireError> {
     let permit = get_pool().semaphore.try_acquire()?;
 
-    let bytes = get_pool().buffer_pool.pop().unwrap();
+    match get_pool().buffer_pool.pop() {
+        Some(bytes) => Ok(ConnectionGuard::new(bytes, permit)),
+        None => {
+            tracing::error!("FATAL: Bytes Buffer Pool is out of sync from Connection Pool");
 
-    Ok(ConnectionGuard::new(bytes, permit))
+            Err(TryAcquireError::Closed)
+        }
+    }
 }

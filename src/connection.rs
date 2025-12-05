@@ -30,7 +30,13 @@ pub(crate) async fn listen(listener: TcpListener, state: Arc<AppState>) -> () {
 
     loop {
         let state = state.clone();
-        let (mut socker, _addr) = listener.accept().await.unwrap();
+        let (mut socker, _addr) = match listener.accept().await {
+            Ok(sock) => sock,
+            Err(e) => {
+                tracing::error!("Failed to accept client connection: {}", e);
+                continue;
+            }
+        };
 
         let conn_permit = match acquire_connection() {
             Ok(permit) => permit,

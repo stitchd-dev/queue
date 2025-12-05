@@ -12,6 +12,7 @@ use tokio::task::JoinHandle;
 #[derive(From, Error, Debug, Display)]
 pub enum AppStateError {
     Pool(PoolError),
+    Query(tokio_postgres::Error),
 }
 
 pub struct AppState {
@@ -39,7 +40,7 @@ impl AppState {
             max_buffer_duration,
             max_events_per_dataset,
         )
-        .await;
+        .await?;
 
         let queues_clone = queues.clone();
 
@@ -54,14 +55,18 @@ impl AppState {
                     tokio::time::sleep(queue_refresh_delay).await;
 
                     let queues = queues_clone.clone();
-                    Self::refresh_queues(
+
+                    if let Err(err) = Self::refresh_queues(
                         &pool,
                         queues,
                         max_buffer_size_clone,
                         max_buffer_duration_clone,
                         max_events_per_dataset_clone,
                     )
-                    .await;
+                    .await
+                    {
+                        tracing::error!("Failed to refresh queues: {}", err);
+                    }
                 }
             }),
         };
@@ -87,8 +92,8 @@ impl AppState {
         max_buffer_size: u8,
         max_buffer_duration: Duration,
         max_events_per_dataset: u32,
-    ) {
-        let queues = Self::get_queues(&pool_clone).await.unwrap();
+    ) -> Result<(), AppStateError> {
+        let queues = Self::get_queues(&pool_clone).await?;
 
         println!("Queues are {:?}", queues);
 
@@ -122,6 +127,8 @@ impl AppState {
                 );
             }
         }
+
+        Ok(())
     }
 
     async fn get_queues(pool: &Pool) -> Result<HashSet<i32>, AppStateError> {
@@ -129,8 +136,7 @@ impl AppState {
 
         let queues = conn
             .query("SELECT id FROM queue WHERE active = true", &[])
-            .await
-            .unwrap();
+            .await?;
 
         Ok(queues
             .iter()
