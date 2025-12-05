@@ -10,6 +10,7 @@ mod connection;
 pub(crate) mod connection_pool;
 mod constant;
 mod error;
+pub mod health;
 pub mod queue;
 mod state;
 
@@ -40,6 +41,8 @@ async fn main() {
     });
 
     let pool = config.create_pool(Some(Runtime::Tokio1), NoTls).unwrap();
+
+    // TODO: Implement a periodic health metric check to check if the connection_pool is healthy.
 
     let state = create_app_state(pool.clone()).await;
 

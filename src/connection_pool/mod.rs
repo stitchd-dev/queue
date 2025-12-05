@@ -2,6 +2,7 @@ mod guard;
 
 pub(crate) use crate::connection_pool::guard::ConnectionGuard;
 use crate::constant::{CONNECTION_LIMIT, IN_FLIGHT_LIMIT, allocate_bytes};
+use crate::health::PoolState;
 use bytes::BytesMut;
 use crossbeam::queue::SegQueue;
 use std::sync::OnceLock;
@@ -9,10 +10,21 @@ use tokio::sync::{Semaphore, SemaphorePermit, TryAcquireError};
 
 static PROCESS_POOL: OnceLock<Semaphore> = OnceLock::new();
 
+fn process_pool() -> &'static Semaphore {
+    PROCESS_POOL.get_or_init(|| Semaphore::new(IN_FLIGHT_LIMIT))
+}
+
 pub fn acquire_process() -> Result<SemaphorePermit<'static>, TryAcquireError> {
     PROCESS_POOL
         .get_or_init(|| Semaphore::new(IN_FLIGHT_LIMIT))
         .try_acquire()
+}
+
+pub fn get_process_pool_health() -> PoolState {
+    PoolState {
+        active: process_pool().available_permits(),
+        total: IN_FLIGHT_LIMIT,
+    }
 }
 
 struct ConnectionPool {
@@ -39,6 +51,13 @@ static POOL: OnceLock<ConnectionPool> = OnceLock::new();
 
 fn get_pool() -> &'static ConnectionPool {
     POOL.get_or_init(|| ConnectionPool::new(CONNECTION_LIMIT))
+}
+
+pub fn get_connection_pool_health() -> PoolState {
+    PoolState {
+        active: get_pool().semaphore.available_permits(),
+        total: CONNECTION_LIMIT as usize,
+    }
 }
 
 pub fn acquire_connection() -> Result<ConnectionGuard, TryAcquireError> {
