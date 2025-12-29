@@ -34,7 +34,7 @@ pub(crate) fn is_ping(bytes: &[u8]) -> bool {
 ///
 /// Returns `Some(&[u8])` with the remaining bytes after the "insert " prefix,
 /// or `None` if the bytes don't start with the insert command.
-pub(crate) fn is_insert(bytes: &[u8]) -> Option<&[u8]> {
+pub(crate) fn extract_payload_if_insert(bytes: &[u8]) -> Option<&[u8]> {
     bytes.strip_prefix(INSERT_MATCH)
 }
 

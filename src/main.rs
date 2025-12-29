@@ -5,7 +5,7 @@
 //! would normally create or obtain a `Queue` from the `queue` module and use
 //! it to buffer and flush events.
 
-mod command;
+mod operation;
 mod connection;
 pub(crate) mod connection_pool;
 mod constant;

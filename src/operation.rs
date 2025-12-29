@@ -3,13 +3,12 @@
 //! This module defines the command protocol for client interactions,
 //! including parsing raw bytes into operations and executing them.
 
-use crate::constant::{is_insert, is_ping, is_valid_chunk, min_len_check};
+use crate::constant::{extract_payload_if_insert, is_ping, is_valid_chunk, min_len_check};
 use crate::state::AppState;
 use derive_more::{Display, From};
 use serde_json::{Deserializer, Value};
 use std::num::ParseIntError;
 use std::str::Utf8Error;
-use tokio::sync::{SemaphorePermit, oneshot};
 
 /// Error type for operation parsing and validation.
 #[derive(Debug, Display, From)]
@@ -68,7 +67,7 @@ impl Operation {
         }
         if is_ping(bytes) {
             Ok(Self::Ping)
-        } else if let Some(bytes) = is_insert(bytes) {
+        } else if let Some(bytes) = extract_payload_if_insert(bytes) {
             let bytes = bytes.trim_ascii();
 
             if bytes.is_empty() {
@@ -125,49 +124,6 @@ impl Operation {
             }
         } else {
             Err(OperationError::OperationNotFound)
-        }
-    }
-}
-
-/// A command to be processed by the worker.
-///
-/// Contains the operation to execute, a response channel, and a processing permit.
-pub struct Command {
-    /// The operation to execute.
-    pub(crate) operation: Operation,
-    /// Channel to send the response back to the client.
-    pub(crate) tx: oneshot::Sender<String>,
-    /// Processing permit that limits concurrent operations.
-    pub(crate) _permit: SemaphorePermit<'static>,
-}
-
-impl Command {
-    /// Processes the command and sends the result back through the response channel.
-    ///
-    /// Handles both `Ping` and `Insert` operations, logging any errors that occur.
-    pub async fn process(self, state: &AppState) {
-        match self.operation {
-            Operation::Ping => {
-                tracing::debug!("Client pinged");
-
-                match self.tx.send("Pong".to_string()) {
-                    Ok(()) => (),
-                    Err(err) => tracing::warn!("Failed to send ping response: {}", err),
-                };
-            }
-            Operation::Insert(queue_id, message) => {
-                tracing::debug!("Inserting data");
-
-                match self
-                    .tx
-                    .send(match state.insert_data(queue_id, message).await {
-                        Ok(()) => "OK".to_string(),
-                        Err(e) => format!("Error: {}", e),
-                    }) {
-                    Ok(()) => (),
-                    Err(err) => tracing::warn!("Failed to send ping response: {}", err),
-                };
-            }
         }
     }
 }

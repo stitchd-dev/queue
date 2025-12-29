@@ -4,7 +4,7 @@
 //! and dispatches them to worker tasks for processing. It implements connection
 //! pooling and rate limiting to prevent resource exhaustion.
 
-use crate::command::{Command, Operation, OperationError};
+use crate::operation::{Operation, OperationError};
 use crate::connection_pool::{acquire_connection, acquire_process};
 use crate::constant::{is_valid_message, read_data};
 use crate::state::AppState;
@@ -13,7 +13,6 @@ use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::net::tcp::OwnedWriteHalf;
-use tokio::sync::oneshot;
 
 /// Main server loop that accepts and handles TCP connections.
 ///
@@ -97,11 +96,6 @@ async fn send_error_response(mut writer: &mut OwnedWriteHalf, e: ProcessError) {
             OperationError::IntParse(err) => format!("Error: Int parse error: {}", err),
             OperationError::QueueNotFound => "Error: Queue not found.".to_string(),
         },
-        ProcessError::Receiver(err) => {
-            tracing::error!("Failed to receive response from worker: {}", err);
-
-            "InternalError: Failed to receive response from processor.".to_string()
-        }
     };
 
     send_response(&mut writer, message.as_bytes()).await;
@@ -123,8 +117,6 @@ pub enum ProcessError {
     LimitsExceeded,
     /// Invalid input or operation error.
     InvalidInput(OperationError),
-    /// Failed to receive response from worker.
-    Receiver(oneshot::error::RecvError),
 }
 
 /// Processes raw bytes from a client connection into a command.
@@ -132,14 +124,12 @@ pub enum ProcessError {
 /// Steps:
 /// 1. Acquires a processing permit (rate limiting).
 /// 2. Parses the bytes into an `Operation`.
-/// 3. Creates a `Command` with a response channel.
-/// 4. Spawns a task to process the command.
-/// 5. Waits for and returns the response.
+/// 3. Processes the operation and returns the response.
 pub async fn process_bytes(
     bytes: &[u8],
     state: Arc<AppState>,
 ) -> Result<String, ProcessError> {
-    let permit = match acquire_process() {
+    let _permit = match acquire_process() {
         Ok(permit) => permit,
         Err(_) => {
             return Err(ProcessError::LimitsExceeded);
@@ -148,17 +138,19 @@ pub async fn process_bytes(
 
     let operation = Operation::read_bytes(bytes, state.as_ref()).await?;
 
-    let (tx, rx) = oneshot::channel();
-
-    let cmd = Command {
-        operation,
-        tx,
-        _permit: permit,
+    let result = match operation {
+        Operation::Ping => {
+            tracing::debug!("Client pinged");
+            "Pong".to_string()
+        }
+        Operation::Insert(queue_id, message) => {
+            tracing::debug!("Inserting data");
+            match state.insert_data(queue_id, message).await {
+                Ok(()) => "OK".to_string(),
+                Err(e) => format!("Error: {}", e),
+            }
+        }
     };
 
-    tokio::spawn(async move {
-        cmd.process(state.as_ref()).await;
-    });
-
-    Ok(rx.await?)
+    Ok(result)
 }
