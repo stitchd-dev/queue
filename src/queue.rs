@@ -60,7 +60,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::mpsc::Receiver;
+use tokio::sync::{Mutex, mpsc};
+use tokio::time::Sleep;
 use tokio_postgres::{binary_copy::BinaryCopyInWriter, types::Type};
 use tracing::{debug, error};
 use uuid::Uuid;
@@ -68,23 +70,19 @@ use uuid::Uuid;
 /// Batching queue that buffers JSON payloads in-memory and flushes to PostgreSQL.
 ///
 /// Constructed via `Queue::get_queue`, which loads metadata from the `queue` table.
+#[derive(Clone)]
 pub struct Queue {
     /// Database identifier of this queue (primary key of `queue` table).
     id: i32,
-    /// In-memory buffer mapping UUID -> (JSON payload, source id).
-    data: Mutex<Vec<Value>>,
     /// Maximum time to wait since the first item was added before auto-flushing.
     max_duration: Duration,
-    /// Handle to a scheduled background task that will run a timed sync.
-    sync_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Connection connection_pool used for database operations.
     pool: deadpool_postgres::Pool,
     /// Number of buffered items that triggers an immediate sync when exceeded.
     max_buffer_size: usize,
-    /// Max Insertion Allowed Size
-    max_insertion_allowed_size: usize,
     /// Max Events Allowed per dataset
     max_events_per_dataset: i32,
+    sender: mpsc::Sender<Vec<Value>>,
 }
 
 impl Queue {
@@ -118,6 +116,7 @@ impl Queue {
                 }
             }
         } as usize;
+
         let max_events_per_dataset = match max_events_per_dataset {
             Some(d) => {
                 if d == 0 {
@@ -132,15 +131,46 @@ impl Queue {
             }
             None => i32::MAX,
         };
+
+        let (sender, mut receiver) = mpsc::channel::<Vec<Value>>(20);
+        let max_duration = max_duration.unwrap_or(Duration::from_secs(10));
+
+        let pool_clone = pool.clone();
+        tokio::spawn(async move {
+            let mut buffer: Vec<Value> = Vec::with_capacity(5 * max_buffer_size);
+
+            let mut buf: Vec<Vec<Value>> = Vec::with_capacity(4);
+            while receiver.recv_many(&mut buf, 4).await > 0 {
+                buffer.extend(buf.drain(..).flatten());
+                if buffer.len() >= max_buffer_size {
+                    let _ = send_data_to_pg(
+                        &pool_clone,
+                        id,
+                        max_events_per_dataset,
+                        buffer.drain(..).collect(),
+                    )
+                    .await;
+                }
+            }
+
+            if buffer.len() > 0 {
+                let _ = send_data_to_pg(
+                    &pool_clone,
+                    id,
+                    max_events_per_dataset,
+                    buffer.drain(..).collect(),
+                )
+                .await;
+            }
+        });
+
         Queue {
             id,
-            data: Default::default(),
-            max_duration: max_duration.unwrap_or(Duration::from_secs(10)),
-            sync_handle: Default::default(),
+            max_duration,
             pool: pool.clone(),
             max_buffer_size,
-            max_insertion_allowed_size: max_buffer_size * 2,
             max_events_per_dataset,
+            sender,
         }
     }
 
@@ -152,185 +182,104 @@ impl Queue {
     pub async fn insert_data(self: &Arc<Self>, data: Vec<Value>) -> Result<(), InsertionError> {
         let len = data.len();
 
-        if len > self.max_insertion_allowed_size {
-            return Err(InsertionError::LimitExceeded(
-                self.max_insertion_allowed_size,
-            ));
+        if len > self.max_buffer_size {
+            return Err(InsertionError::LimitExceeded(self.max_buffer_size));
         } else if len == 0 {
             return Err(InsertionError::EmptyData);
-        } else if len >= self.max_buffer_size {
-            let queue = self.clone();
-
-            if let Err(err) = queue.send_data_to_pg(data).await {
-                error!("Sending to PG Failed : {}", err);
-            }
-
-            return Ok(());
-        }
-
-        let length = {
-            let mut lock = self.data.lock().await;
-
-            if lock.is_empty() {
-                self.schedule_auto_sync().await;
-            }
-
-            lock.extend(data);
-
-            lock.len()
-        };
-
-        if length >= self.max_buffer_size
-            && let Err(err) = self.sync_data().await
-        {
-            error!("Error during auto-sync: {}", err);
+        } else {
+            self.sender.send(data).await?;
         }
 
         Ok(())
     }
+}
 
-    /// Cancel any scheduled auto-sync task, waiting for it to finish if running.
-    async fn cancel_auto_sync(&self) {
-        let mut sync_handle = self.sync_handle.lock().await;
-        if let Some(handle) = sync_handle.take() {
-            handle.abort();
-        }
-    }
+/// Internal helper to send data to PostgreSQL.
+///
+/// This method performs the actual database operations to persist buffered data:
+/// 1. Acquires a database connection and starts a transaction.
+/// 2. Calls `get_current_dataset` to determine the target dataset.
+/// 3. Uses binary COPY to bulk insert data into the data and job tables.
+/// 4. Calls `release_reservation` to finalize the dataset reservation.
+/// 5. Commits the transaction.
+async fn send_data_to_pg(
+    pool: &deadpool_postgres::Pool,
+    queue_id: i32,
+    max_events_per_dataset: i32,
+    data: Vec<Value>,
+) -> Result<(), SyncError> {
+    debug!("Sending data to PG.");
+    let mut client = pool.get().await?;
 
-    /// Schedule an auto-sync to run after `max_duration` if data is still pending.
-    ///
-    /// Any previously scheduled auto-sync is first canceled to avoid duplicates.
-    async fn schedule_auto_sync(self: &Arc<Self>) {
-        // Cancel any existing scheduled sync
-        self.cancel_auto_sync().await;
+    let tx = client.transaction().await?;
 
-        let queue = Arc::clone(self);
-
-        let mut sync_handle = self.sync_handle.lock().await;
-
-        *sync_handle = Some(tokio::spawn(async move {
-            tokio::time::sleep(queue.max_duration).await;
-            debug!("Running auto sync");
-
-            tokio::spawn(async move {
-                if let Err(err) = queue.sync_data().await {
-                    error!("Failed to sync data.{}", err);
-                }
-            });
-        }));
-    }
-
-    /// Flush buffered data to PostgreSQL using the binary ` COPY ` inside a transaction.
-    ///
-    /// Steps:
-    /// 1. Cancel any pending auto-sync (to avoid duplicate flushes).
-    /// 2. Drain the in-memory buffer and clear the timing state.
-    /// 3. Get a dataset id via `get_current_dataset` to decide the target tables.
-    /// 4. COPY buffered rows into `queue_<id>_data_<dataset>` and corresponding job ids
-    ///    into `queue_<id>_job_<dataset>`.
-    /// 5. Call `release_reservation` with the actual inserted count, then commit.
-    pub async fn sync_data(&self) -> Result<(), SyncError> {
-        debug!("Syncing Buffer Data");
-        // Drain the buffer atomically to avoid losing entries on failure later.
-        let data = {
-            let mut lock = self.data.lock().await;
-            self.cancel_auto_sync().await;
-            lock.drain(..).collect::<Vec<_>>()
-        };
-
-        if data.is_empty() {
-            return Ok(());
-        }
-
-        self.send_data_to_pg(data).await
-    }
-
-    /// Internal helper to send data to PostgreSQL.
-    ///
-    /// This method performs the actual database operations to persist buffered data:
-    /// 1. Acquires a database connection and starts a transaction.
-    /// 2. Calls `get_current_dataset` to determine the target dataset.
-    /// 3. Uses binary COPY to bulk insert data into the data and job tables.
-    /// 4. Calls `release_reservation` to finalize the dataset reservation.
-    /// 5. Commits the transaction.
-    async fn send_data_to_pg(&self, data: Vec<Value>) -> Result<(), SyncError> {
-        debug!("Sending data to PG.");
-        let mut client = self.pool.get().await?;
-
-        let tx = client.transaction().await?;
-
-        // Get the current dataset
-        let dataset_id: i32 = tx
-            .query_one(
-                "SELECT get_current_dataset($1, $2, $3)",
-                &[
-                    &(self.id),
-                    &(data.len() as i32),
-                    &(self.max_events_per_dataset),
-                ],
-            )
-            .await
-            .map_err(|err| {
-                println!("{}", err);
-                err
-            })?
-            .get(0);
-
-        let data_table_name = format!("queue_{}_data_{}", self.id, dataset_id);
-        let job_table_name = format!("queue_{}_job_{}", self.id, dataset_id);
-
-        // Use COPY to bulk insert into data table
-        let data_sink = tx
-            .copy_in(&format!(
-                "COPY {} (id, data) FROM STDIN WITH (FORMAT binary)",
-                data_table_name
-            ))
-            .await?;
-
-        let data_writer = BinaryCopyInWriter::new(data_sink, &[Type::UUID, Type::JSONB]);
-
-        futures::pin_mut!(data_writer);
-
-        let data = data
-            .into_iter()
-            .map(|v| (Uuid::new_v4(), v))
-            .collect::<HashMap<_, _>>();
-
-        for (uuid, json_data) in &data {
-            // Write one data row: (uuid, jsonb payload, BIGINT source id)
-            data_writer.as_mut().write(&[uuid, json_data]).await?;
-        }
-
-        data_writer.finish().await?;
-
-        // Use COPY to bulk insert into job table
-        let job_sink = tx
-            .copy_in(&format!(
-                "COPY {} (data) FROM STDIN WITH (FORMAT binary)",
-                job_table_name
-            ))
-            .await?;
-
-        let job_writer = BinaryCopyInWriter::new(job_sink, &[Type::UUID]);
-
-        futures::pin_mut!(job_writer);
-
-        for uuid in data.keys() {
-            // Write the job row referencing the data UUID.
-            job_writer.as_mut().write(&[uuid]).await?;
-        }
-
-        job_writer.finish().await?;
-
-        // Release the reservation with an actual inserted count
-        tx.execute(
-            "SELECT release_reservation($1, $2, $3)",
-            &[&self.id, &dataset_id, &(data.len() as i32)],
+    // Get the current dataset
+    let dataset_id: i32 = tx
+        .query_one(
+            "SELECT get_current_dataset($1, $2, $3)",
+            &[&(queue_id), &(data.len() as i32), &(max_events_per_dataset)],
         )
+        .await
+        .map_err(|err| {
+            println!("{}", err);
+            err
+        })?
+        .get(0);
+
+    let data_table_name = format!("queue_{}_data_{}", queue_id, dataset_id);
+    let job_table_name = format!("queue_{}_job_{}", queue_id, dataset_id);
+
+    // Use COPY to bulk insert into data table
+    let data_sink = tx
+        .copy_in(&format!(
+            "COPY {} (id, data) FROM STDIN WITH (FORMAT binary)",
+            data_table_name
+        ))
         .await?;
 
-        tx.commit().await?;
+    let data_writer = BinaryCopyInWriter::new(data_sink, &[Type::UUID, Type::JSONB]);
 
-        Ok(())
+    futures::pin_mut!(data_writer);
+
+    let data = data
+        .into_iter()
+        .map(|v| (Uuid::new_v4(), v))
+        .collect::<HashMap<_, _>>();
+
+    for (uuid, json_data) in &data {
+        // Write one data row: (uuid, jsonb payload, BIGINT source id)
+        data_writer.as_mut().write(&[uuid, json_data]).await?;
     }
+
+    data_writer.finish().await?;
+
+    // Use COPY to bulk insert into job table
+    let job_sink = tx
+        .copy_in(&format!(
+            "COPY {} (data) FROM STDIN WITH (FORMAT binary)",
+            job_table_name
+        ))
+        .await?;
+
+    let job_writer = BinaryCopyInWriter::new(job_sink, &[Type::UUID]);
+
+    futures::pin_mut!(job_writer);
+
+    for uuid in data.keys() {
+        // Write the job row referencing the data UUID.
+        job_writer.as_mut().write(&[uuid]).await?;
+    }
+
+    job_writer.finish().await?;
+
+    // Release the reservation with an actual inserted count
+    tx.execute(
+        "SELECT release_reservation($1, $2, $3)",
+        &[&queue_id, &dataset_id, &(data.len() as i32)],
+    )
+    .await?;
+
+    tx.commit().await?;
+
+    Ok(())
 }
