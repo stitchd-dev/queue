@@ -5,12 +5,12 @@
 //! would normally create or obtain a `Queue` from the `queue` module and use
 //! it to buffer and flush events.
 
-mod operation;
 mod connection;
 pub(crate) mod connection_pool;
 mod constant;
 mod error;
 pub mod health;
+mod operation;
 pub mod queue;
 mod state;
 
@@ -57,7 +57,7 @@ async fn create_app_state(pool: Pool) -> Arc<AppState> {
         Duration::from_secs(120),
         128,
         Duration::from_secs(2),
-        100000,
+        50000,
     )
     .await
     .map_err(|e| {

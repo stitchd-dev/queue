@@ -15,14 +15,12 @@ pub enum InsertionError {
     EmptyData,
     /// Queue not Found
     QueueNotFound(i32),
-    MPSCError(mpsc::error::SendError<Vec<Value>>)
+    MPSCError(mpsc::error::SendError<Vec<Value>>),
 }
 
 impl Error for InsertionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            _ => None,
-        }
+        None
     }
 }
 

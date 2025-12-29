@@ -255,3 +255,21 @@ $$ language plpgsql;
 -- Testing: Create a queue for initial setup
 select *
 from create_queue();
+select *
+from create_queue();
+select *
+from create_queue();
+select *
+from create_queue();
+select *
+from create_queue();
+select *
+from create_queue();
+select *
+from create_queue();
+select *
+from create_queue();
+select *
+from create_queue();
+select *
+from create_queue();

@@ -4,9 +4,9 @@
 //! and dispatches them to worker tasks for processing. It implements connection
 //! pooling and rate limiting to prevent resource exhaustion.
 
-use crate::operation::{Operation, OperationError};
 use crate::connection_pool::{acquire_connection, acquire_process};
 use crate::constant::{is_valid_message, read_data};
+use crate::operation::{Operation, OperationError};
 use crate::state::AppState;
 use derive_more::{Display, From};
 use std::sync::Arc;
@@ -125,10 +125,7 @@ pub enum ProcessError {
 /// 1. Acquires a processing permit (rate limiting).
 /// 2. Parses the bytes into an `Operation`.
 /// 3. Processes the operation and returns the response.
-pub async fn process_bytes(
-    bytes: &[u8],
-    state: Arc<AppState>,
-) -> Result<String, ProcessError> {
+pub async fn process_bytes(bytes: &[u8], state: Arc<AppState>) -> Result<String, ProcessError> {
     let _permit = match acquire_process() {
         Ok(permit) => permit,
         Err(_) => {

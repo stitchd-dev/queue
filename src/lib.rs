@@ -236,7 +236,7 @@ pub trait EventProcessor: Send + Sync {
     }
 
     /// Compacts failed datasets to optimize storage.
-    async fn failed_dataset_compaction(pool: &Pool) {
+    async fn failed_dataset_compaction(_pool: &Pool) {
         // TODO
     }
 
@@ -294,7 +294,7 @@ pub trait EventProcessor: Send + Sync {
         data_table_name: &String,
         jobs: &HashMap<i32, Job>,
     ) {
-        let events = get_events(&mut conn, &data_table_name, &jobs).await;
+        let events = get_events(conn, data_table_name, jobs).await;
 
         let results = futures::future::join_all(jobs.iter().map(|(job_id, job)| {
             let event_data = events.get(&job.data_uuid).cloned().unwrap();
@@ -380,7 +380,7 @@ async fn get_next_processing_dataset(
     let mut res = conn.query("UPDATE queue SET processing_dataset=processing_dataset+1 WHERE id = $1 AND processing_dataset = $2 AND processing_dataset < current_dataset RETURNING processing_dataset", &[&queue_id, &processing_dataset]).await.unwrap();
 
     let new_processing_dataset: i32 = if res.is_empty() {
-        get_processing_dataset(&conn, &queue_id).await
+        get_processing_dataset(conn, queue_id).await
     } else {
         res.pop().unwrap().get(0)
     };
@@ -417,7 +417,7 @@ async fn get_next_failed_dataset(
         let mut res = conn.query("UPDATE queue SET last_failed_dataset=last_failed_dataset+1 WHERE id = $1 AND last_failed_dataset = $2 AND last_failed_dataset < processing_dataset RETURNING last_failed_dataset", &[&queue_id, &last_failed_dataset]).await.unwrap();
 
         let new_last_failed_dataset: i32 = if res.is_empty() {
-            get_last_failed_dataset(&conn, &queue_id).await
+            get_last_failed_dataset(conn, queue_id).await
         } else {
             res.pop().unwrap().get(0)
         };
@@ -434,26 +434,24 @@ async fn get_events(
     data_table_name: &String,
     jobs: &HashMap<i32, Job>,
 ) -> HashMap<Uuid, Value> {
-    let data_uuids: Vec<Uuid> = jobs.values().map(|job| job.data_uuid.clone()).collect();
+    let data_uuids: Vec<Uuid> = jobs.values().map(|job| job.data_uuid).collect();
 
-    let events = conn
-        .query(
-            &format!(
-                "SELECT id, data FROM {} WHERE id = any($1)",
-                data_table_name
-            ),
-            &[&data_uuids],
-        )
-        .await
-        .unwrap()
-        .iter()
-        .map(|row| {
-            let uuid: Uuid = row.get(0);
-            let data: Value = row.get(1);
-            (uuid, data)
-        })
-        .collect::<HashMap<Uuid, Value>>();
-    events
+    conn.query(
+        &format!(
+            "SELECT id, data FROM {} WHERE id = any($1)",
+            data_table_name
+        ),
+        &[&data_uuids],
+    )
+    .await
+    .unwrap()
+    .iter()
+    .map(|row| {
+        let uuid: Uuid = row.get(0);
+        let data: Value = row.get(1);
+        (uuid, data)
+    })
+    .collect::<HashMap<Uuid, Value>>()
 }
 
 async fn get_failed_jobs(

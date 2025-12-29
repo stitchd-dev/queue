@@ -60,9 +60,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc::Receiver;
-use tokio::sync::{Mutex, mpsc};
-use tokio::time::Sleep;
+use tokio::sync::mpsc;
 use tokio_postgres::{binary_copy::BinaryCopyInWriter, types::Type};
 use tracing::{debug, error};
 use uuid::Uuid;
@@ -72,16 +70,8 @@ use uuid::Uuid;
 /// Constructed via `Queue::get_queue`, which loads metadata from the `queue` table.
 #[derive(Clone)]
 pub struct Queue {
-    /// Database identifier of this queue (primary key of `queue` table).
-    id: i32,
-    /// Maximum time to wait since the first item was added before auto-flushing.
-    max_duration: Duration,
-    /// Connection connection_pool used for database operations.
-    pool: deadpool_postgres::Pool,
     /// Number of buffered items that triggers an immediate sync when exceeded.
     max_buffer_size: usize,
-    /// Max Events Allowed per dataset
-    max_events_per_dataset: i32,
     sender: mpsc::Sender<Vec<Value>>,
 }
 
@@ -140,36 +130,65 @@ impl Queue {
             let mut buffer: Vec<Value> = Vec::with_capacity(5 * max_buffer_size);
 
             let mut buf: Vec<Vec<Value>> = Vec::with_capacity(4);
-            while receiver.recv_many(&mut buf, 4).await > 0 {
-                buffer.extend(buf.drain(..).flatten());
-                if buffer.len() >= max_buffer_size {
-                    let _ = send_data_to_pg(
-                        &pool_clone,
-                        id,
-                        max_events_per_dataset,
-                        buffer.drain(..).collect(),
-                    )
-                    .await;
-                }
-            }
 
-            if buffer.len() > 0 {
-                let _ = send_data_to_pg(
-                    &pool_clone,
-                    id,
-                    max_events_per_dataset,
-                    buffer.drain(..).collect(),
-                )
-                .await;
+            let sleep = tokio::time::sleep(max_duration);
+            tokio::pin!(sleep);
+            let mut timer_active = false;
+
+            loop {
+                tokio::select! {
+                    // 1. Receive data from the channel
+                    count = receiver.recv_many(&mut buf, 4) => {
+                        if count == 0 {
+                            if !buffer.is_empty() {
+                                let _ = send_data_to_pg(
+                                    &pool_clone,
+                                    id,
+                                    max_events_per_dataset,
+                                    std::mem::take(&mut buffer),
+                                )
+                                .await;
+                            }
+                            break;
+                        } // Channel closed
+
+                        let is_first_event = buffer.is_empty();
+                        buffer.extend(buf.drain(..).flatten());
+
+                        if buffer.len() >= max_buffer_size {
+                            let _ = send_data_to_pg(
+                                &pool_clone,
+                                id,
+                                max_events_per_dataset,
+                                std::mem::take(&mut buffer),
+                            ).await;
+                            timer_active = false;
+                        }
+
+                        // Start timer if this is the first batch of events in an empty buffer
+                        if is_first_event && !buffer.is_empty() {
+                            sleep.as_mut().reset(tokio::time::Instant::now() + max_duration);
+                            timer_active = true;
+                        }
+                    }
+                    // 2. Timeout reached
+                    _ = &mut sleep, if timer_active => {
+                        if !buffer.is_empty() {
+                            let _ = send_data_to_pg(
+                                &pool_clone,
+                                id,
+                                max_events_per_dataset,
+                                std::mem::take(&mut buffer),
+                            ).await;
+                        }
+                        timer_active = false;
+                    }
+                }
             }
         });
 
         Queue {
-            id,
-            max_duration,
-            pool: pool.clone(),
             max_buffer_size,
-            max_events_per_dataset,
             sender,
         }
     }

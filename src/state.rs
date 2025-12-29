@@ -70,9 +70,9 @@ impl AppState {
 
         let queues_clone = queues.clone();
 
-        let max_buffer_size_clone = max_buffer_size.clone();
-        let max_buffer_duration_clone = max_buffer_duration.clone();
-        let max_events_per_dataset_clone = max_events_per_dataset.clone();
+        let max_buffer_size_clone = max_buffer_size;
+        let max_buffer_duration_clone = max_buffer_duration;
+        let max_events_per_dataset_clone = max_events_per_dataset;
 
         let state = Self {
             queues,
@@ -132,7 +132,7 @@ impl AppState {
         max_buffer_duration: Duration,
         max_events_per_dataset: u32,
     ) -> Result<(), AppStateError> {
-        let queues = Self::get_queues(&pool_clone).await?;
+        let queues = Self::get_queues(pool_clone).await?;
 
         println!("Queues are {:?}", queues);
 
