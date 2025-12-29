@@ -22,8 +22,6 @@ const MAX_MESSAGE_SIZE_U64: u64 = MAX_MESSAGE_SIZE as u64;
 
 /// Maximum number of concurrent in-flight processing requests.
 pub(crate) const IN_FLIGHT_LIMIT: usize = 200;
-/// Buffer size for the event processor MPSC channel.
-pub(crate) const EVENT_PROCESSOR_MPSC_BUFFER_LIMIT: usize = 100;
 /// Maximum number of concurrent TCP connections.
 pub(crate) const CONNECTION_LIMIT: u16 = 20;
 

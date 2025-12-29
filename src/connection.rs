@@ -6,32 +6,14 @@
 
 use crate::command::{Command, Operation, OperationError};
 use crate::connection_pool::{acquire_connection, acquire_process};
-use crate::constant::{EVENT_PROCESSOR_MPSC_BUFFER_LIMIT, is_valid_message, read_data};
+use crate::constant::{is_valid_message, read_data};
 use crate::state::AppState;
 use derive_more::{Display, From};
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::net::tcp::OwnedWriteHalf;
-use tokio::sync::mpsc::error::SendError;
-use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
-
-/// Spawns a worker task that processes commands from the channel.
-///
-/// The worker receives commands via `worker_rx` and spawns a separate task
-/// for each command to process it concurrently.
-fn process_worker(mut worker_rx: mpsc::Receiver<Command>, state: Arc<AppState>) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        while let Some(command) = worker_rx.recv().await {
-            let state = state.clone();
-
-            tokio::spawn(async move {
-                command.process(&state).await;
-            });
-        }
-    })
-}
+use tokio::sync::oneshot;
 
 /// Main server loop that accepts and handles TCP connections.
 ///
@@ -42,10 +24,6 @@ fn process_worker(mut worker_rx: mpsc::Receiver<Command>, state: Arc<AppState>) 
 ///
 /// The function runs indefinitely, accepting connections until the listener is closed.
 pub(crate) async fn listen(listener: TcpListener, state: Arc<AppState>) -> () {
-    let (server_tx, worker_rx) = mpsc::channel::<Command>(EVENT_PROCESSOR_MPSC_BUFFER_LIMIT);
-
-    let _worker_handle = process_worker(worker_rx, state.clone());
-
     loop {
         let state = state.clone();
         let (mut stream, _addr) = match listener.accept().await {
@@ -65,7 +43,6 @@ pub(crate) async fn listen(listener: TcpListener, state: Arc<AppState>) -> () {
             }
         };
 
-        let server_tx = server_tx.clone();
         tokio::spawn(async move {
             let mut conn_permit = conn_permit;
             let buf = conn_permit.bytes();
@@ -85,7 +62,7 @@ pub(crate) async fn listen(listener: TcpListener, state: Arc<AppState>) -> () {
                     break;
                 }
 
-                let res = process_bytes(&server_tx, buf.as_ref(), &state).await;
+                let res = process_bytes(buf.as_ref(), state.clone()).await;
 
                 match res {
                     Ok(res) => send_response(&mut writer, res.as_bytes()).await,
@@ -120,15 +97,10 @@ async fn send_error_response(mut writer: &mut OwnedWriteHalf, e: ProcessError) {
             OperationError::IntParse(err) => format!("Error: Int parse error: {}", err),
             OperationError::QueueNotFound => "Error: Queue not found.".to_string(),
         },
-        ProcessError::Send(err) => {
-            tracing::error!("Failed to send command to worker: {}", err);
-
-            "InternalError: Failed to send event to processor.".to_string()
-        }
         ProcessError::Receiver(err) => {
-            tracing::error!("Failed to receive command from worker: {}", err);
+            tracing::error!("Failed to receive response from worker: {}", err);
 
-            "InternalError: Failed to receive event from processor.".to_string()
+            "InternalError: Failed to receive response from processor.".to_string()
         }
     };
 
@@ -151,8 +123,6 @@ pub enum ProcessError {
     LimitsExceeded,
     /// Invalid input or operation error.
     InvalidInput(OperationError),
-    /// Failed to send command to worker channel.
-    Send(SendError<Command>),
     /// Failed to receive response from worker.
     Receiver(oneshot::error::RecvError),
 }
@@ -163,12 +133,11 @@ pub enum ProcessError {
 /// 1. Acquires a processing permit (rate limiting).
 /// 2. Parses the bytes into an `Operation`.
 /// 3. Creates a `Command` with a response channel.
-/// 4. Sends the command to the worker channel.
+/// 4. Spawns a task to process the command.
 /// 5. Waits for and returns the response.
 pub async fn process_bytes(
-    sender: &mpsc::Sender<Command>,
     bytes: &[u8],
-    state: &AppState,
+    state: Arc<AppState>,
 ) -> Result<String, ProcessError> {
     let permit = match acquire_process() {
         Ok(permit) => permit,
@@ -177,7 +146,7 @@ pub async fn process_bytes(
         }
     };
 
-    let operation = Operation::read_bytes(bytes, state).await?;
+    let operation = Operation::read_bytes(bytes, state.as_ref()).await?;
 
     let (tx, rx) = oneshot::channel();
 
@@ -187,7 +156,9 @@ pub async fn process_bytes(
         _permit: permit,
     };
 
-    sender.send(cmd).await?;
+    tokio::spawn(async move {
+        cmd.process(state.as_ref()).await;
+    });
 
     Ok(rx.await?)
 }
