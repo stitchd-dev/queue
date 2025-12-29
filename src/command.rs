@@ -1,3 +1,8 @@
+//! Command parsing and operation handling.
+//!
+//! This module defines the command protocol for client interactions,
+//! including parsing raw bytes into operations and executing them.
+
 use crate::constant::{is_insert, is_ping, is_valid_chunk, min_len_check};
 use crate::state::AppState;
 use derive_more::{Display, From};
@@ -6,30 +11,56 @@ use std::num::ParseIntError;
 use std::str::Utf8Error;
 use tokio::sync::{SemaphorePermit, oneshot};
 
+/// Error type for operation parsing and validation.
 #[derive(Debug, Display, From)]
 pub enum OperationError {
+    /// Operation type not recognized.
     OperationNotFound,
+    /// Payload is invalid or empty.
     InvalidPayload,
+    /// Individual JSON chunk exceeds size limit.
     ChunkSizeExceeded(usize),
+    /// JSON deserialization failed.
     DeserializationError(DeSerializationError),
+    /// UTF-8 decoding error.
     UTFError(Utf8Error),
+    /// Integer parsing error.
     IntParse(ParseIntError),
+    /// Queue ID not found in the system.
     QueueNotFound,
 }
 
+/// Detailed deserialization error with chunk index.
 #[derive(Debug, Display)]
 #[display("Error serializing chunk {}: {}", index, error)]
 pub struct DeSerializationError {
+    /// Index of the chunk that failed to deserialize.
     index: usize,
+    /// Underlying serde_json error.
     error: serde_json::Error,
 }
 
+/// Represents a parsed operation from a client command.
 pub enum Operation {
+    /// Ping command to check server availability.
     Ping,
+    /// Insert command with queue ID and JSON payloads.
     Insert(i32, Vec<Value>),
 }
 
 impl Operation {
+    /// Parses raw bytes into an `Operation`.
+    ///
+    /// Supported commands:
+    /// - `ping` - Returns `Operation::Ping`
+    /// - `insert <queue_id> <json_payloads>` - Returns `Operation::Insert` with parsed data
+    ///
+    /// # Errors
+    /// Returns `OperationError` if:
+    /// - The command is not recognized
+    /// - The payload is invalid or empty
+    /// - JSON deserialization fails
+    /// - The queue ID doesn't exist
     pub(crate) async fn read_bytes(bytes: &[u8], state: &AppState) -> Result<Self, OperationError> {
         let bytes = bytes.trim_ascii();
         if !min_len_check(bytes) {
@@ -98,13 +129,22 @@ impl Operation {
     }
 }
 
+/// A command to be processed by the worker.
+///
+/// Contains the operation to execute, a response channel, and a processing permit.
 pub struct Command {
+    /// The operation to execute.
     pub(crate) operation: Operation,
+    /// Channel to send the response back to the client.
     pub(crate) tx: oneshot::Sender<String>,
+    /// Processing permit that limits concurrent operations.
     pub(crate) _permit: SemaphorePermit<'static>,
 }
 
 impl Command {
+    /// Processes the command and sends the result back through the response channel.
+    ///
+    /// Handles both `Ping` and `Insert` operations, logging any errors that occur.
     pub async fn process(self, state: &AppState) {
         match self.operation {
             Operation::Ping => {

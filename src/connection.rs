@@ -1,3 +1,9 @@
+//! TCP connection handling and command processing.
+//!
+//! This module manages incoming TCP connections, parses commands from clients,
+//! and dispatches them to worker tasks for processing. It implements connection
+//! pooling and rate limiting to prevent resource exhaustion.
+
 use crate::command::{Command, Operation, OperationError};
 use crate::connection_pool::{acquire_connection, acquire_process};
 use crate::constant::{EVENT_PROCESSOR_MPSC_BUFFER_LIMIT, is_valid_message, read_data};
@@ -11,6 +17,10 @@ use tokio::sync::mpsc::error::SendError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+/// Spawns a worker task that processes commands from the channel.
+///
+/// The worker receives commands via `worker_rx` and spawns a separate task
+/// for each command to process it concurrently.
 fn process_worker(mut worker_rx: mpsc::Receiver<Command>, state: Arc<AppState>) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(command) = worker_rx.recv().await {
@@ -23,6 +33,14 @@ fn process_worker(mut worker_rx: mpsc::Receiver<Command>, state: Arc<AppState>) 
     })
 }
 
+/// Main server loop that accepts and handles TCP connections.
+///
+/// For each incoming connection:
+/// 1. Acquires a connection permit from the pool (rejects if limit reached).
+/// 2. Spawns a task to read and process messages from the client.
+/// 3. Sends responses back to the client.
+///
+/// The function runs indefinitely, accepting connections until the listener is closed.
 pub(crate) async fn listen(listener: TcpListener, state: Arc<AppState>) -> () {
     let (server_tx, worker_rx) = mpsc::channel::<Command>(EVENT_PROCESSOR_MPSC_BUFFER_LIMIT);
 
@@ -30,7 +48,7 @@ pub(crate) async fn listen(listener: TcpListener, state: Arc<AppState>) -> () {
 
     loop {
         let state = state.clone();
-        let (mut socker, _addr) = match listener.accept().await {
+        let (mut stream, _addr) = match listener.accept().await {
             Ok(sock) => sock,
             Err(e) => {
                 tracing::error!("Failed to accept client connection: {}", e);
@@ -42,7 +60,7 @@ pub(crate) async fn listen(listener: TcpListener, state: Arc<AppState>) -> () {
             Ok(permit) => permit,
             Err(_) => {
                 tracing::warn!("Too many active connections.");
-                send_response(&mut socker, b"Error: Too many active connections.").await;
+                send_response(&mut stream, b"Error: Too many active connections.").await;
                 continue;
             }
         };
@@ -52,7 +70,7 @@ pub(crate) async fn listen(listener: TcpListener, state: Arc<AppState>) -> () {
             let mut conn_permit = conn_permit;
             let buf = conn_permit.bytes();
 
-            let (reader, mut writer) = socker.into_split();
+            let (reader, mut writer) = stream.into_split();
 
             let mut reader = BufReader::new(reader);
 
@@ -80,6 +98,10 @@ pub(crate) async fn listen(listener: TcpListener, state: Arc<AppState>) -> () {
     }
 }
 
+/// Sends an error response to the client based on the error type.
+///
+/// Converts `ProcessError` variants into human-readable error messages
+/// and writes them to the client connection.
 async fn send_error_response(mut writer: &mut OwnedWriteHalf, e: ProcessError) {
     let message = match e {
         ProcessError::LimitsExceeded => {
@@ -113,20 +135,36 @@ async fn send_error_response(mut writer: &mut OwnedWriteHalf, e: ProcessError) {
     send_response(&mut writer, message.as_bytes()).await;
 }
 
+/// Writes a response to the client connection.
+///
+/// Logs an error if the write fails but does not propagate the error.
 async fn send_response<T: AsyncWriteExt + Unpin>(writer: &mut T, bytes: &[u8]) -> () {
     if let Err(e) = writer.write_all(bytes).await {
         tracing::error!("Failed to write to client: {}", e);
     }
 }
 
+/// Error type for command processing operations.
 #[derive(Debug, Display, From)]
 pub enum ProcessError {
+    /// Processing limit exceeded (too many in-flight requests).
     LimitsExceeded,
+    /// Invalid input or operation error.
     InvalidInput(OperationError),
+    /// Failed to send command to worker channel.
     Send(SendError<Command>),
+    /// Failed to receive response from worker.
     Receiver(oneshot::error::RecvError),
 }
 
+/// Processes raw bytes from a client connection into a command.
+///
+/// Steps:
+/// 1. Acquires a processing permit (rate limiting).
+/// 2. Parses the bytes into an `Operation`.
+/// 3. Creates a `Command` with a response channel.
+/// 4. Sends the command to the worker channel.
+/// 5. Waits for and returns the response.
 pub async fn process_bytes(
     sender: &mpsc::Sender<Command>,
     bytes: &[u8],

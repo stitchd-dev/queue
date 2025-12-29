@@ -1,3 +1,8 @@
+//! Application state management and queue lifecycle.
+//!
+//! This module manages the global application state, including the collection
+//! of active queues and their periodic refresh from the database.
+
 use crate::error::InsertionError;
 use crate::queue::Queue;
 use deadpool_postgres::{Pool, PoolError};
@@ -9,22 +14,43 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
+/// Error type for application state operations.
 #[derive(From, Error, Debug, Display)]
 pub enum AppStateError {
+    /// Database connection pool error.
     Pool(PoolError),
+    /// Database query error.
     Query(tokio_postgres::Error),
 }
 
+/// Global application state containing all active queues.
+///
+/// The state maintains a collection of queues and automatically refreshes
+/// them from the database at regular intervals.
 pub struct AppState {
+    /// Map of queue IDs to queue instances.
     queues: Arc<RwLock<HashMap<i32, Arc<Queue>>>>,
+    /// Background task handle for periodic queue refresh.
     _refresh_handle: JoinHandle<()>,
 }
 
 impl AppState {
+    /// Checks if a queue with the given ID exists in the state.
     pub async fn check_if_queue_exists(&self, queue_id: i32) -> bool {
         self.queues.read().await.contains_key(&queue_id)
     }
 
+    /// Initializes the application state and starts the queue refresh loop.
+    ///
+    /// # Arguments
+    /// * `pool` - Database connection pool.
+    /// * `queue_refresh_delay` - Interval between queue refreshes.
+    /// * `max_buffer_size` - Maximum buffer size for each queue.
+    /// * `max_buffer_duration` - Maximum duration before auto-sync.
+    /// * `max_events_per_dataset` - Maximum events per dataset.
+    ///
+    /// # Returns
+    /// An `Arc<AppState>` on success, or an error if initialization fails.
     pub async fn start(
         pool: Pool,
         queue_refresh_delay: Duration,
@@ -74,6 +100,14 @@ impl AppState {
         Ok(Arc::new(state))
     }
 
+    /// Inserts data into the specified queue.
+    ///
+    /// # Arguments
+    /// * `queue_id` - The ID of the target queue.
+    /// * `data` - Vector of JSON values to insert.
+    ///
+    /// # Errors
+    /// Returns `InsertionError::QueueNotFound` if the queue doesn't exist.
     pub async fn insert_data(&self, queue_id: i32, data: Vec<Value>) -> Result<(), InsertionError> {
         let queue = self
             .queues
@@ -86,6 +120,11 @@ impl AppState {
         queue.insert_data(data).await
     }
 
+    /// Refreshes the queue collection from the database.
+    ///
+    /// Queries the database for active queues and updates the in-memory collection:
+    /// - Removes queues that are no longer active.
+    /// - Adds newly activated queues.
     async fn refresh_queues(
         pool_clone: &Pool,
         queues_clone: Arc<RwLock<HashMap<i32, Arc<Queue>>>>,
@@ -131,6 +170,7 @@ impl AppState {
         Ok(())
     }
 
+    /// Fetches the set of active queue IDs from the database.
     async fn get_queues(pool: &Pool) -> Result<HashSet<i32>, AppStateError> {
         let conn = pool.get().await?;
 

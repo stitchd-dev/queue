@@ -245,6 +245,14 @@ impl Queue {
         self.send_data_to_pg(data).await
     }
 
+    /// Internal helper to send data to PostgreSQL.
+    ///
+    /// This method performs the actual database operations to persist buffered data:
+    /// 1. Acquires a database connection and starts a transaction.
+    /// 2. Calls `get_current_dataset` to determine the target dataset.
+    /// 3. Uses binary COPY to bulk insert data into the data and job tables.
+    /// 4. Calls `release_reservation` to finalize the dataset reservation.
+    /// 5. Commits the transaction.
     async fn send_data_to_pg(&self, data: Vec<Value>) -> Result<(), SyncError> {
         debug!("Sending data to PG.");
         let mut client = self.pool.get().await?;
