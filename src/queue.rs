@@ -56,7 +56,6 @@
 //! ```
 
 use crate::error::{InsertionError, SyncError};
-use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -72,7 +71,7 @@ use uuid::Uuid;
 pub struct Queue {
     /// Number of buffered items that triggers an immediate sync when exceeded.
     max_buffer_size: usize,
-    sender: mpsc::Sender<Vec<Value>>,
+    sender: mpsc::Sender<Vec<Vec<u8>>>,
 }
 
 impl Queue {
@@ -122,14 +121,14 @@ impl Queue {
             None => i32::MAX,
         };
 
-        let (sender, mut receiver) = mpsc::channel::<Vec<Value>>(20);
+        let (sender, mut receiver) = mpsc::channel::<Vec<Vec<u8>>>(20);
         let max_duration = max_duration.unwrap_or(Duration::from_secs(10));
 
         let pool_clone = pool.clone();
         tokio::spawn(async move {
-            let mut buffer: Vec<Value> = Vec::with_capacity(5 * max_buffer_size);
+            let mut buffer: Vec<Vec<u8>> = Vec::with_capacity(5 * max_buffer_size);
 
-            let mut buf: Vec<Vec<Value>> = Vec::with_capacity(4);
+            let mut buf: Vec<Vec<Vec<u8>>> = Vec::with_capacity(4);
 
             let sleep = tokio::time::sleep(max_duration);
             tokio::pin!(sleep);
@@ -198,7 +197,7 @@ impl Queue {
     /// Behavior:
     /// - If this is the first item in an empty buffer, starts a timed auto-sync.
     /// - If the buffer size exceeds `max_size`, triggers an immediate sync.
-    pub async fn insert_data(self: &Arc<Self>, data: Vec<Value>) -> Result<(), InsertionError> {
+    pub async fn insert_data(self: &Arc<Self>, data: Vec<Vec<u8>>) -> Result<(), InsertionError> {
         let len = data.len();
 
         if len > self.max_buffer_size {
@@ -225,7 +224,7 @@ async fn send_data_to_pg(
     pool: &deadpool_postgres::Pool,
     queue_id: i32,
     max_events_per_dataset: i32,
-    data: Vec<Value>,
+    data: Vec<Vec<u8>>,
 ) -> Result<(), SyncError> {
     debug!("Sending data to PG.");
     let mut client = pool.get().await?;
@@ -256,7 +255,7 @@ async fn send_data_to_pg(
         ))
         .await?;
 
-    let data_writer = BinaryCopyInWriter::new(data_sink, &[Type::UUID, Type::JSONB]);
+    let data_writer = BinaryCopyInWriter::new(data_sink, &[Type::UUID, Type::BYTEA]);
 
     futures::pin_mut!(data_writer);
 

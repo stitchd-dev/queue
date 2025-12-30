@@ -108,7 +108,7 @@ impl AppState {
     ///
     /// # Errors
     /// Returns `InsertionError::QueueNotFound` if the queue doesn't exist.
-    pub async fn insert_data(&self, queue_id: i32, data: Vec<Value>) -> Result<(), InsertionError> {
+    pub async fn insert_data(&self, queue_id: i32, data: Vec<Vec<u8>>) -> Result<(), InsertionError> {
         let queue = self
             .queues
             .load()

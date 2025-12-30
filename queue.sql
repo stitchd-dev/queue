@@ -86,7 +86,7 @@ begin
     execute format(
             'create table %I (
                 id     uuid primary key,
-                data   jsonb not null
+                data   bytea not null
             )',
             data_table_name);
 

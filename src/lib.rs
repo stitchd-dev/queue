@@ -448,8 +448,8 @@ async fn get_events(
     .iter()
     .map(|row| {
         let uuid: Uuid = row.get(0);
-        let data: Value = row.get(1);
-        (uuid, data)
+        let data: Vec<u8> = row.get(1);
+        (uuid, serde_json::from_slice(&data).unwrap())
     })
     .collect::<HashMap<Uuid, Value>>()
 }
@@ -565,11 +565,12 @@ mod tests {
         }
 
         async fn process(event: Value) -> Result<(), Error> {
+            debug!("Processing event: {:?}", event);
             Ok(())
         }
 
         fn queue_id() -> i32 {
-            1
+            2
         }
 
         fn concurrent_processing_limit() -> i64 {

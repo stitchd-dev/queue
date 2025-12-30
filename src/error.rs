@@ -2,7 +2,6 @@
 
 use deadpool_postgres::PoolError;
 use derive_more::with_trait::{Display, Error, From};
-use serde_json::Value;
 use tokio::sync::mpsc;
 
 /// Error type for data insertion operations.
@@ -15,7 +14,7 @@ pub enum InsertionError {
     EmptyData,
     /// Queue not Found
     QueueNotFound(i32),
-    MPSCError(mpsc::error::SendError<Vec<Value>>),
+    MPSCError(mpsc::error::SendError<Vec<Vec<u8>>>),
 }
 
 impl Error for InsertionError {

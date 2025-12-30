@@ -19,6 +19,7 @@ use crate::state::AppState;
 use deadpool::Runtime;
 use deadpool_postgres::tokio_postgres::NoTls;
 use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod};
+use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -45,6 +46,33 @@ async fn main() {
     // TODO: Implement a periodic health metric check to check if the connection_pool is healthy.
 
     let state = create_app_state(pool.clone()).await;
+
+    // for i in 1..11 {
+    //     let state = state.clone();
+    //     tokio::spawn(async move {
+    //         println!("Starting  {}", i);
+    //         for j in 0..100 {
+    //             for k in 0..500 {
+    //                 if let Err(err) = state
+    //                     .insert_data(
+    //                         i,
+    //                         (0..10)
+    //                             .map(|l| {
+    //                                 serde_json::to_vec(&json!({"b": j, "c": k, "d": l})).unwrap()
+    //                             })
+    //                             .collect(),
+    //                     )
+    //                     .await
+    //                 {
+    //                     println!("Insertion Error: {:?}", err);
+    //                 }
+    //             }
+    //         }
+    //         println!("Finished  {}", i);
+    //     });
+    // }
+    //
+    // tokio::time::sleep(Duration::from_secs(10)).await;
 
     let listener = TcpListener::bind("127.0.0.1:9092").await.unwrap();
 

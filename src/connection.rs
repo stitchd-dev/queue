@@ -142,6 +142,10 @@ pub async fn process_bytes(bytes: &[u8], state: Arc<AppState>) -> Result<String,
         }
         Operation::Insert(queue_id, message) => {
             tracing::debug!("Inserting data");
+            let message = message
+                .into_iter()
+                .map(|v| serde_json::to_vec(&v).unwrap())
+                .collect();
             match state.insert_data(queue_id, message).await {
                 Ok(()) => "OK".to_string(),
                 Err(e) => format!("Error: {}", e),
