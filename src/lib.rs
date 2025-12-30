@@ -289,7 +289,7 @@ pub trait EventProcessor: Send + Sync {
 
     async fn _process_jobs(
         queue_id: &i32,
-        mut conn: &mut Object,
+        conn: &mut Object,
         processing_dataset: i32,
         data_table_name: &String,
         jobs: &HashMap<i32, Job>,

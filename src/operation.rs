@@ -86,7 +86,7 @@ impl Operation {
                 let queue_id_str = std::str::from_utf8(queue_id_bytes)?;
                 let queue_id: i32 = queue_id_str.parse()?;
 
-                if !state.check_if_queue_exists(queue_id).await {
+                if !state.check_if_queue_exists(queue_id) {
                     return Err(OperationError::QueueNotFound);
                 }
 
