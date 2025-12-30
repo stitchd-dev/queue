@@ -3,12 +3,9 @@
 //! This module defines the command protocol for client interactions,
 //! including parsing raw bytes into operations and executing them.
 
-use crate::constant::{extract_payload_if_insert, is_ping, is_valid_chunk, min_len_check};
 use crate::state::AppState;
 use derive_more::{Display, From};
-use serde_json::{Deserializer, Value};
-use std::num::ParseIntError;
-use std::str::Utf8Error;
+use std::array::TryFromSliceError;
 
 /// Error type for operation parsing and validation.
 #[derive(Debug, Display, From)]
@@ -17,26 +14,9 @@ pub enum OperationError {
     OperationNotFound,
     /// Payload is invalid or empty.
     InvalidPayload,
-    /// Individual JSON chunk exceeds size limit.
-    ChunkSizeExceeded(usize),
-    /// JSON deserialization failed.
-    DeserializationError(DeSerializationError),
-    /// UTF-8 decoding error.
-    UTFError(Utf8Error),
-    /// Integer parsing error.
-    IntParse(ParseIntError),
+    SliceError(TryFromSliceError),
     /// Queue ID not found in the system.
     QueueNotFound,
-}
-
-/// Detailed deserialization error with chunk index.
-#[derive(Debug, Display)]
-#[display("Error serializing chunk {}: {}", index, error)]
-pub struct DeSerializationError {
-    /// Index of the chunk that failed to deserialize.
-    index: usize,
-    /// Underlying serde_json error.
-    error: serde_json::Error,
 }
 
 /// Represents a parsed operation from a client command.
@@ -44,7 +24,7 @@ pub enum Operation {
     /// Ping command to check server availability.
     Ping,
     /// Insert command with queue ID and JSON payloads.
-    Insert(i32, Vec<Value>),
+    Insert(i32, Vec<Vec<u8>>),
 }
 
 impl Operation {
@@ -58,72 +38,68 @@ impl Operation {
     /// Returns `OperationError` if:
     /// - The command is not recognized
     /// - The payload is invalid or empty
-    /// - JSON deserialization fails
     /// - The queue ID doesn't exist
     pub(crate) async fn read_bytes(bytes: &[u8], state: &AppState) -> Result<Self, OperationError> {
-        let bytes = bytes.trim_ascii();
-        if !min_len_check(bytes) {
-            return Err(OperationError::OperationNotFound);
-        }
-        if is_ping(bytes) {
-            Ok(Self::Ping)
-        } else if let Some(bytes) = extract_payload_if_insert(bytes) {
-            let bytes = bytes.trim_ascii();
+        let (command_byte, payload) = bytes.split_first().ok_or(OperationError::InvalidPayload)?;
 
-            if bytes.is_empty() {
-                Err(OperationError::InvalidPayload)
-            } else {
-                // Find space within first 11 bytes (max i32 digits + sign)
-                // i32 range is -2,147,483,648 to 2,147,483,647 (max 11 chars including sign)
-                let search_limit = bytes.len().min(12); // +1 for the space
-                let space_pos = bytes[..search_limit]
-                    .iter()
-                    .position(|&b| b == b' ')
+        match command_byte {
+            0x00 => {
+                // Ping
+                Ok(Self::Ping)
+            }
+            0x01 => {
+                // Insert
+                let (queue_id, payload) = payload
+                    .split_at_checked(4)
                     .ok_or(OperationError::InvalidPayload)?;
 
-                // Extract queue_id bytes
-                let queue_id_bytes = &bytes[..space_pos];
-                let queue_id_str = std::str::from_utf8(queue_id_bytes)?;
-                let queue_id: i32 = queue_id_str.parse()?;
+                let queue_id = i32::from_be_bytes(queue_id.try_into()?);
 
                 if !state.check_if_queue_exists(queue_id) {
                     return Err(OperationError::QueueNotFound);
                 }
+                let (buf_length, mut payload) = payload
+                    .split_first()
+                    .ok_or(OperationError::InvalidPayload)?;
 
-                // Extract Payload bytes
-                let bytes = bytes[space_pos + 1..].trim_ascii();
+                let buf_length = buf_length.clone() as usize;
 
-                let mut result = Vec::new();
-                let mut stream = Deserializer::from_slice(bytes).into_iter::<Value>();
-
-                let mut prev_offset = 0;
-                let mut index = 0;
-
-                while let Some(value) = stream.next() {
-                    let value = value.map_err(|e| {
-                        OperationError::DeserializationError(DeSerializationError {
-                            index,
-                            error: e,
-                        })
-                    })?;
-
-                    let current_offset = stream.byte_offset();
-
-                    let size = current_offset - prev_offset;
-
-                    if is_valid_chunk(size) {
-                        prev_offset = current_offset;
-                        result.push(value);
-                        index += 1;
-                    } else {
-                        return Err(OperationError::ChunkSizeExceeded(index));
-                    }
+                if buf_length == 0 {
+                    return Err(OperationError::InvalidPayload);
                 }
 
-                Ok(Self::Insert(queue_id, result))
+                let mut result: Vec<Vec<u8>> = Vec::with_capacity(buf_length);
+                while !payload.is_empty() {
+                    if buf_length == result.len() {
+                        return Err(OperationError::InvalidPayload);
+                    }
+
+                    let (payload_length, data) = payload
+                        .split_at_checked(2)
+                        .ok_or(OperationError::InvalidPayload)?;
+
+                    let payload_length = u16::from_be_bytes(payload_length.try_into()?);
+
+                    if payload_length == 0 {
+                        return Err(OperationError::InvalidPayload);
+                    }
+
+                    let (res, remainder) = data
+                        .split_at_checked(payload_length as usize)
+                        .ok_or(OperationError::InvalidPayload)?;
+
+                    payload = remainder;
+
+                    result.push(res.to_vec());
+                }
+
+                if result.is_empty() {
+                    return Err(OperationError::InvalidPayload);
+                }
+
+                Ok(Operation::Insert(queue_id, result))
             }
-        } else {
-            Err(OperationError::OperationNotFound)
+            _ => Err(OperationError::OperationNotFound),
         }
     }
 }

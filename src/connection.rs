@@ -5,7 +5,7 @@
 //! pooling and rate limiting to prevent resource exhaustion.
 
 use crate::connection_pool::{acquire_connection, acquire_process};
-use crate::constant::{is_valid_message, read_data};
+use crate::constant::{MAX_MESSAGE_SIZE, read_data};
 use crate::operation::{Operation, OperationError};
 use crate::state::AppState;
 use derive_more::{Display, From};
@@ -55,7 +55,7 @@ pub(crate) async fn listen(listener: TcpListener, state: Arc<AppState>) -> () {
                     break;
                 }
 
-                if !is_valid_message(bytes_read) {
+                if bytes_read > MAX_MESSAGE_SIZE {
                     send_response(&mut writer, b"Error: Message too large. Disconnecting...").await;
 
                     break;
@@ -85,16 +85,8 @@ async fn send_error_response(mut writer: &mut OwnedWriteHalf, e: ProcessError) {
         }
         ProcessError::InvalidInput(e) => match e {
             OperationError::OperationNotFound => "Error: Operation not found.".to_string(),
-            OperationError::InvalidPayload => "Error: Empty Payload.".to_string(),
-            OperationError::ChunkSizeExceeded(err) => {
-                format!("Error: Chunk size exceeded: {}", err)
-            }
-            OperationError::DeserializationError(err) => {
-                format!("Error: Deserialization error: {}", err)
-            }
-            OperationError::UTFError(err) => format!("Error: UTF error: {}", err),
-            OperationError::IntParse(err) => format!("Error: Int parse error: {}", err),
             OperationError::QueueNotFound => "Error: Queue not found.".to_string(),
+            _ => "Error: Invalid Payload.".to_string(),
         },
     };
 
@@ -142,15 +134,12 @@ pub async fn process_bytes(bytes: &[u8], state: Arc<AppState>) -> Result<String,
         }
         Operation::Insert(queue_id, message) => {
             tracing::debug!("Inserting data");
-            let message = message
-                .into_iter()
-                .map(|v| serde_json::to_vec(&v).unwrap())
-                .collect();
             match state.insert_data(queue_id, message).await {
                 Ok(()) => "OK".to_string(),
                 Err(e) => format!("Error: {}", e),
             }
         }
+        _ => "OK".to_string(),
     };
 
     Ok(result)
