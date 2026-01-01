@@ -1,9 +1,8 @@
-//! Binary entrypoint used for quick local connectivity checks.
+//! Event queue server application.
 //!
-//! This example sets up a Deadpool Postgres connection connection_pool and performs a
-//! simple `SELECT 1 + $1` query to verify database access. Application code
-//! would normally create or obtain a `Queue` from the `queue` module and use
-//! it to buffer and flush events.
+//! This is the main binary that starts the TCP server for handling event queue operations.
+//! It sets up a PostgreSQL connection pool, initializes the application state with active queues,
+//! and listens for incoming client connections on port 9092.
 
 mod connection;
 pub(crate) mod connection_pool;
@@ -19,7 +18,6 @@ use crate::state::AppState;
 use deadpool::Runtime;
 use deadpool_postgres::tokio_postgres::NoTls;
 use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod};
-use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -79,6 +77,16 @@ async fn main() {
     listen(listener, state).await;
 }
 
+/// Creates and initializes the application state.
+///
+/// # Arguments
+/// * `pool` - PostgreSQL connection pool.
+///
+/// # Returns
+/// An `Arc<AppState>` with configured queue refresh and buffer settings.
+///
+/// # Panics
+/// Panics if state initialization fails.
 async fn create_app_state(pool: Pool) -> Arc<AppState> {
     AppState::start(
         pool,

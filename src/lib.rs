@@ -79,13 +79,19 @@ pub struct EventProcessHandler {
     pub failed_dataset_compaction: JoinHandle<()>,
 }
 
+/// Internal error type for tracking processing failures with retry information.
 struct ProcessError {
+    /// Number of times this job has been retried.
     retry_count: i32,
+    /// The error that occurred during processing.
     _error: Error,
 }
 
+/// Represents a job to be processed from the queue.
 pub struct Job {
+    /// UUID of the event data in the data table.
     data_uuid: Uuid,
+    /// Number of times this job has been retried.
     retry_count: i32,
 }
 
@@ -287,6 +293,10 @@ pub trait EventProcessor: Send + Sync {
         }
     }
 
+    /// Internal method to process a batch of jobs.
+    ///
+    /// Fetches event data, processes each job concurrently, and updates job statuses
+    /// based on success or failure.
     async fn _process_jobs(
         queue_id: &i32,
         conn: &mut Object,
@@ -350,6 +360,14 @@ pub trait EventProcessor: Send + Sync {
     }
 }
 
+/// Retrieves the current processing dataset ID for a queue.
+///
+/// # Arguments
+/// * `conn` - Database connection.
+/// * `queue_id` - The queue identifier.
+///
+/// # Returns
+/// The current processing dataset ID.
 async fn get_processing_dataset(conn: &Object, queue_id: &i32) -> i32 {
     let row = conn
         .query_one(
@@ -361,6 +379,14 @@ async fn get_processing_dataset(conn: &Object, queue_id: &i32) -> i32 {
     row.get(0)
 }
 
+/// Retrieves the last failed dataset ID for a queue.
+///
+/// # Arguments
+/// * `conn` - Database connection.
+/// * `queue_id` - The queue identifier.
+///
+/// # Returns
+/// The last failed dataset ID.
 async fn get_last_failed_dataset(conn: &Object, queue_id: &i32) -> i32 {
     let row = conn
         .query_one(
@@ -372,6 +398,15 @@ async fn get_last_failed_dataset(conn: &Object, queue_id: &i32) -> i32 {
     row.get(0)
 }
 
+/// Attempts to advance to the next processing dataset.
+///
+/// # Arguments
+/// * `queue_id` - The queue identifier.
+/// * `conn` - Database connection.
+/// * `processing_dataset` - Current processing dataset ID.
+///
+/// # Returns
+/// `Some(new_dataset_id)` if advanced, `None` if no more datasets to process.
 async fn get_next_processing_dataset(
     queue_id: &i32,
     conn: &mut Object,
@@ -391,6 +426,16 @@ async fn get_next_processing_dataset(
     }
 }
 
+/// Attempts to advance to the next failed dataset for retry processing.
+///
+/// # Arguments
+/// * `queue_id` - The queue identifier.
+/// * `conn` - Database connection.
+/// * `last_failed_dataset` - Current failed dataset ID.
+/// * `job_table_name` - Name of the job table to check.
+///
+/// # Returns
+/// `Some(new_dataset_id)` if advanced, `None` if no more failed datasets or current has pending jobs.
 async fn get_next_failed_dataset(
     queue_id: &i32,
     conn: &mut Object,
@@ -429,6 +474,15 @@ async fn get_next_failed_dataset(
     }
 }
 
+/// Fetches event data for a batch of jobs.
+///
+/// # Arguments
+/// * `conn` - Database connection.
+/// * `data_table_name` - Name of the data table.
+/// * `jobs` - Map of job IDs to Job structs.
+///
+/// # Returns
+/// HashMap mapping data UUIDs to their JSON values.
 async fn get_events(
     conn: &mut Object,
     data_table_name: &String,
@@ -454,6 +508,16 @@ async fn get_events(
     .collect::<HashMap<Uuid, Value>>()
 }
 
+/// Fetches and locks failed or timed-out jobs for retry processing.
+///
+/// # Arguments
+/// * `conn` - Database connection.
+/// * `job_table_name` - Name of the job table.
+/// * `concurrent_processing_limit` - Maximum number of jobs to fetch.
+/// * `processing_timeout` - Duration to set for next retry attempt.
+///
+/// # Returns
+/// HashMap of job IDs to Job structs ready for processing.
 async fn get_failed_jobs(
     conn: &mut Object,
     job_table_name: &String,
@@ -497,6 +561,16 @@ async fn get_failed_jobs(
     .collect::<HashMap<i32, Job>>()
 }
 
+/// Fetches and locks pending jobs for initial processing.
+///
+/// # Arguments
+/// * `conn` - Database connection.
+/// * `job_table_name` - Name of the job table.
+/// * `concurrent_processing_limit` - Maximum number of jobs to fetch.
+/// * `processing_timeout` - Duration to set for processing timeout.
+///
+/// # Returns
+/// HashMap of job IDs to Job structs ready for processing.
 async fn get_pending_jobs(
     conn: &mut Object,
     job_table_name: &String,

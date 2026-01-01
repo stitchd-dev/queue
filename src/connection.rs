@@ -139,7 +139,6 @@ pub async fn process_bytes(bytes: &[u8], state: Arc<AppState>) -> Result<String,
                 Err(e) => format!("Error: {}", e),
             }
         }
-        _ => "OK".to_string(),
     };
 
     Ok(result)

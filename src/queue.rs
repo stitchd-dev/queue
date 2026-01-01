@@ -30,27 +30,34 @@
 //! use deadpool_postgres::{Config, ManagerConfig, RecyclingMethod};
 //! use deadpool_postgres::tokio_postgres::NoTls;
 //! use serde_json::json;
+//! use std::time::Duration;
 //!
 //! # async fn example() -> anyhow::Result<()> {
-//! // Build a connection_pool (normally from env/config)
+//! // Build a connection pool (normally from env/config)
 //! let mut cfg = Config::new();
-//! cfg.dbname = Some("vishal".into());
-//! cfg.user = Some("vishal".into());
+//! cfg.dbname = Some("postgres".into());
+//! cfg.user = Some("postgres".into());
 //! cfg.password = Some("password".into());
 //! cfg.host = Some("localhost".into());
 //! cfg.port = Some(5432);
 //! cfg.manager = Some(ManagerConfig { recycling_method: RecyclingMethod::Fast });
-//! let connection_pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls)?;
+//! let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls)?;
 //!
-//! // Obtain a queue by destination id (with default max_duration and max_size)
-//! let queue: Arc<Queue> = Queue::get_queue(42, connection_pool.clone(), None, None).await.map_err(|_| anyhow::anyhow!("missing destination"))?;
+//! // Create a queue with custom settings
+//! let queue = Queue::get_queue(
+//!     42,                              // queue_id
+//!     pool.clone(),                    // connection pool
+//!     Some(Duration::from_secs(10)),   // max_duration
+//!     Some(128),                       // max_buffer_size
+//!     Some(50000),                     // max_events_per_dataset
+//! );
 //!
-//! // Insert some payloads from source id 7
-//! queue.insert_data(json!({"event": "signup", "user_id": 1}), 7).await?;
-//! queue.insert_data(json!({"event": "click", "path": "/home"}), 7).await?;
-//!
-//! // Optionally force a flush (normally automatic by max_size/time)
-//! queue.sync_data().await;
+//! // Insert binary payloads (e.g., serialized JSON)
+//! let data = vec![
+//!     serde_json::to_vec(&json!({"event": "signup", "user_id": 1}))?,
+//!     serde_json::to_vec(&json!({"event": "click", "path": "/home"}))?,
+//! ];
+//! queue.insert_data(data).await?;
 //! # Ok(())
 //! # }
 //! ```

@@ -133,7 +133,7 @@ impl AppState {
     ) -> Result<(), AppStateError> {
         let queues = Self::get_queues(pool_clone).await?;
 
-        println!("Queues are {:?}", queues);
+        tracing::debug!("Queues are {:?}", queues);
 
         let current_queues = queues_clone
             .load()
